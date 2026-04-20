@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# story-closeout — archive a Guardian story folder into the PKM vault and media archive
+#
+# Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM]
+#
+# Text files   → ~/notebook/archive/          (flat, tagged by frontmatter)
+# Small docs   → ~/notebook/assets/<slug>/    (PDFs, EPUBs, DOCXs, CSVs, JSONs, DBs, ZIPs)
+# Large media  → $MEDIA_ARCHIVE/<date_slug>/  (video, audio — MOVED, not copied)
+# Working .md  → listed for review (fold into entity pages)
+#
+# Does NOT modify text source files — copies to vault.
+# DOES move media files (video/audio) to free NVMe space.
+
+set -euo pipefail
+
+VAULT="$HOME/notebook"
+ARCHIVE="$VAULT/archive"
+ASSETS="$VAULT/assets"
+MEDIA_ARCHIVE="/media/jason/4tb-external1/Reporting_Media_Archive"
+
+usage() {
+    echo "Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM]"
+    echo ""
+    echo "  <story-directory>  Path to the Guardian story folder"
+    echo "  --slug NAME        Override the directory name for archive/assets subfolders"
+    echo "  --date YYYY_MM     Reporting date prefix for media archive (e.g. 2026_03)"
+    echo "                     Defaults to current year_month"
+    echo ""
+    echo "Example: story-closeout ~/Guardian/old_stories/Schwemmer --date 2026_03"
+    exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+STORY_DIR="$1"
+shift
+
+SLUG=""
+DATE_PREFIX=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --slug) SLUG="$2"; shift 2 ;;
+        --date) DATE_PREFIX="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+if [[ ! -d "$STORY_DIR" ]]; then
+    echo "Error: '$STORY_DIR' is not a directory"
+    exit 1
+fi
+
+STORY_DIR="$(realpath "$STORY_DIR")"
+[[ -z "$SLUG" ]] && SLUG="$(basename "$STORY_DIR")"
+[[ -z "$DATE_PREFIX" ]] && DATE_PREFIX="$(date +%Y_%m)"
+
+MEDIA_DEST="$MEDIA_ARCHIVE/${DATE_PREFIX}_${SLUG}"
+
+echo "Story closeout: $STORY_DIR"
+echo "Slug: $SLUG"
+echo "Vault: $VAULT"
+echo "  Archive (text):  $ARCHIVE"
+echo "  Assets (docs):   $ASSETS/$SLUG/"
+echo "  Media (video/audio): $MEDIA_DEST/"
+echo "---"
+
+mkdir -p "$ARCHIVE"
+
+# Counters
+copied_published=0
+copied_transcripts=0
+copied_clips=0
+copied_ror=0
+copied_assets=0
+moved_media=0
+
+# Helper: check basename collision
+check_collision() {
+    local basename="$1"
+    local dest_dir="${2:-$ARCHIVE}"
+    if [[ -f "$dest_dir/$basename" ]]; then
+        echo "  WARNING: file already exists — skipping $basename"
+        return 1
+    fi
+    local existing
+    existing="$(find "$VAULT/pages" -maxdepth 1 -name "$basename" 2>/dev/null || true)"
+    if [[ -n "$existing" ]]; then
+        echo "  WARNING: basename collision with pages/ — skipping $basename"
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
+# TEXT FILES → archive/ (flat)
+# ============================================================
+
+# --- Published article ---
+published_files="$(find "$STORY_DIR" -maxdepth 1 -iname '*guardian*.md' -type f || true)"
+if [[ -n "$published_files" ]]; then
+    while IFS= read -r f; do
+        dest_name="$(basename "$f")"
+        if check_collision "$dest_name"; then
+            cp "$f" "$ARCHIVE/$dest_name"
+            copied_published=$((copied_published + 1))
+        fi
+    done <<< "$published_files"
+    echo "Published: copied $copied_published file(s)"
+else
+    echo "Published: NOT FOUND"
+    echo "  ⚠ Download the published article to $STORY_DIR before continuing."
+fi
+
+# --- Transcripts ---
+transcript_files="$(find "$STORY_DIR" -name '*.txt' ! -name '*-timestamped.txt' -type f || true)"
+if [[ -n "$transcript_files" ]]; then
+    while IFS= read -r f; do
+        dest_name="$(basename "$f" .txt).md"
+        if check_collision "$dest_name"; then
+            cp "$f" "$ARCHIVE/$dest_name"
+            copied_transcripts=$((copied_transcripts + 1))
+        fi
+    done <<< "$transcript_files"
+    echo "Transcripts: copied $copied_transcripts"
+else
+    echo "Transcripts: none found"
+fi
+
+# --- Background and Coverage clips ---
+copy_clip_dir() {
+    local src_dir="$1"
+    local label="$2"
+    if [[ -d "$src_dir" ]]; then
+        local count=0
+        while IFS= read -r f; do
+            dest_name="$(basename "$f")"
+            if check_collision "$dest_name"; then
+                cp "$f" "$ARCHIVE/$dest_name"
+                count=$((count + 1))
+            fi
+        done < <(find "$src_dir" -name '*.md' -type f)
+        copied_clips=$((copied_clips + count))
+        echo "$label: copied $count"
+    else
+        echo "$label: not found"
+    fi
+}
+
+copy_clip_dir "$STORY_DIR/Background" "Background/"
+copy_clip_dir "$STORY_DIR/Coverage" "Coverage/"
+
+# --- RoR files ---
+ror_files="$(find "$STORY_DIR" -maxdepth 1 \( -name 'RoR*.md' -o -name '*_ROR.md' -o -name '*_ror.md' \) -type f || true)"
+if [[ -n "$ror_files" ]]; then
+    while IFS= read -r f; do
+        dest_name="$(basename "$f")"
+        if check_collision "$dest_name"; then
+            cp "$f" "$ARCHIVE/$dest_name"
+            copied_ror=$((copied_ror + 1))
+        fi
+    done <<< "$ror_files"
+    echo "RoR files: copied $copied_ror"
+else
+    echo "RoR files: none found"
+fi
+
+# ============================================================
+# SMALL DOCUMENTS → assets/<slug>/
+# ============================================================
+
+doc_files="$(find "$STORY_DIR" \( \
+    -name '*.pdf' -o -name '*.epub' -o -name '*.docx' \
+    -o -name '*.csv' -o -name '*.json' -o -name '*.db' \
+    -o -name '*.zip' -o -name '*.ZIP' \
+    \) -type f || true)"
+
+if [[ -n "$doc_files" ]]; then
+    mkdir -p "$ASSETS/$SLUG"
+    while IFS= read -r f; do
+        dest_name="$(basename "$f")"
+        if [[ ! -f "$ASSETS/$SLUG/$dest_name" ]]; then
+            cp "$f" "$ASSETS/$SLUG/$dest_name"
+            copied_assets=$((copied_assets + 1))
+        else
+            echo "  WARNING: already exists in assets — skipping $dest_name"
+        fi
+    done <<< "$doc_files"
+    echo "Assets (docs): copied $copied_assets → $ASSETS/$SLUG/"
+else
+    echo "Assets (docs): none found"
+fi
+
+# ============================================================
+# LARGE MEDIA → Reporting_Media_Archive (MOVED)
+# ============================================================
+
+media_files="$(find "$STORY_DIR" \( \
+    -name '*.webm' -o -name '*.mkv' -o -name '*.mp4' \
+    -o -name '*.mp3' -o -name '*.m4a' \
+    \) -type f || true)"
+
+if [[ -n "$media_files" ]]; then
+    if [[ ! -d "/media/jason/4tb-external1" ]]; then
+        echo "Media: ⚠ 4TB SSD not mounted at /media/jason/4tb-external1 — SKIPPING media move"
+        echo "  Run again when drive is mounted, or move manually to $MEDIA_DEST/"
+    else
+        mkdir -p "$MEDIA_DEST"
+        while IFS= read -r f; do
+            dest_name="$(basename "$f")"
+            if [[ ! -f "$MEDIA_DEST/$dest_name" ]]; then
+                mv "$f" "$MEDIA_DEST/$dest_name"
+                moved_media=$((moved_media + 1))
+            else
+                echo "  WARNING: already exists in media archive — skipping $dest_name"
+            fi
+        done <<< "$media_files"
+        echo "Media: moved $moved_media file(s) → $MEDIA_DEST/"
+    fi
+else
+    echo "Media: none found"
+fi
+
+# ============================================================
+# REDUNDANT FILES (skipped)
+# ============================================================
+
+skipped="$(find "$STORY_DIR" \( \
+    -name '*.srt' -o -name '*-timestamped.txt' -o -name '*.py' \
+    \) -type f | wc -l)"
+
+# Working .md files
+working_files="$(find "$STORY_DIR" -maxdepth 1 -name '*.md' -type f \
+    ! -name 'RoR*.md' ! -name '*_ROR.md' ! -name '*_ror.md' \
+    ! -iname '*guardian*.md' \
+    || true)"
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+echo "---"
+total_text=$((copied_published + copied_transcripts + copied_clips + copied_ror))
+echo "Text → archive/:     $total_text files"
+echo "Docs → assets/:      $copied_assets files"
+echo "Media → SSD:         $moved_media files (moved)"
+echo "Skipped (srt/ts/py): $skipped files"
+echo ""
+
+if [[ -n "$working_files" ]]; then
+    echo "Working .md files (review — fold into entity pages, don't copy as-is):"
+    while IFS= read -r f; do
+        echo "  $(basename "$f")"
+    done <<< "$working_files"
+    echo ""
+fi
+
+echo "Next steps (use Claude):"
+echo "  1. Add frontmatter + wikilinks to text files in $ARCHIVE"
+echo "     (tag each with story: \"[[${SLUG} (story)]]\")"
+echo "  2. Create story index page: ~/notebook/pages/${SLUG} (story).md"
+echo "     — link assets from $ASSETS/$SLUG/ at bottom of page"
+echo "     — note media archive location: $MEDIA_DEST/"
+echo "  3. Create/update entity pages for people, orgs, events, places"
+echo "  4. Fold working notes into entity pages as subheadings"

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: yt-transcript [yt-dlp options] URL [URL...]"
+    echo ""
+    echo "Downloads video + SRT via yt-dlp (using your config), then produces"
+    echo "a clean .transcript.txt alongside each .srt file."
+    echo ""
+    echo "All arguments are passed through to yt-dlp."
+    exit 1
+}
+
+[[ $# -eq 0 ]] && usage
+
+yt-dlp "$@"
+
+shopt -s nullglob
+for srt in *.en.srt; do
+    base="${srt%.en.srt}"
+    txt="${base}.transcript.txt"
+
+    if [[ -f "$txt" ]]; then
+        echo "Skipping $txt (already exists)"
+        continue
+    fi
+
+    awk '
+    /^[0-9]+$/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+        line = $0
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        if (line != "" && !seen[line]++) {
+            print line
+        }
+    }
+    ' "$srt" > "$txt"
+
+    echo "Created $txt"
+done

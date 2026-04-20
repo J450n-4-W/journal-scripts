@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FLATPAK_PROFILE="$HOME/.var/app/org.chromium.Chromium/config/chromium"
+DEB_PROFILE="$HOME/.config/chromium"
+PASSWORD_CSV="$HOME/Downloads/Chrome Passwords.csv"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[✗]${NC} $1"; }
+
+# Preflight checks
+if pgrep -f "chromium" > /dev/null 2>&1; then
+    error "Chromium is still running. Close it first."
+    exit 1
+fi
+
+if [[ ! -d "$FLATPAK_PROFILE/Default" ]]; then
+    error "Flatpak profile not found at $FLATPAK_PROFILE/Default"
+    exit 1
+fi
+
+if [[ -d "$DEB_PROFILE/Default" ]] && [[ "$(ls -A "$DEB_PROFILE/Default" 2>/dev/null)" ]]; then
+    warn "Deb profile already exists at $DEB_PROFILE/Default"
+    read -rp "Overwrite? (y/N) " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+    rm -rf "$DEB_PROFILE/Default"
+fi
+
+echo ""
+echo "Migrating Flatpak Chromium profile → deb Chromium..."
+echo ""
+
+# Create target directory
+mkdir -p "$DEB_PROFILE/Default"
+
+# --- Profile-level files (Default/) ---
+PROFILE_FILES=(
+    # History
+    "History"
+    "History-journal"
+    # Cookies
+    "Cookies"
+    "Cookies-journal"
+    # Autofill, addresses, credit cards
+    "Web Data"
+    "Web Data-journal"
+    # Top sites / shortcuts
+    "Top Sites"
+    "Top Sites-journal"
+    "Shortcuts"
+    "Shortcuts-journal"
+    # Favicons
+    "Favicons"
+    "Favicons-journal"
+    # Bookmarks (may not exist)
+    "Bookmarks"
+    "Bookmarks.bak"
+    # Site settings, preferences
+    "Preferences"
+    # Extension cookies
+    "Extension Cookies"
+    "Extension Cookies-journal"
+)
+
+copied=0
+skipped=0
+
+for f in "${PROFILE_FILES[@]}"; do
+    src="$FLATPAK_PROFILE/Default/$f"
+    if [[ -e "$src" ]]; then
+        cp -a "$src" "$DEB_PROFILE/Default/$f"
+        info "Copied: $f"
+        ((copied++))
+    else
+        ((skipped++))
+    fi
+done
+
+# --- Directories ---
+PROFILE_DIRS=(
+    "Extensions"
+    "Local Extension Settings"
+    "Extension State"
+    "Extension Scripts"
+    "Extension Rules"
+    "Local Storage"
+    "Session Storage"
+    "IndexedDB"
+    "databases"
+    "blob_storage"
+    "File System"
+    "Service Worker"
+    "GCM Store"
+    "Download Service"
+    "Feature Engagement Tracker"
+)
+
+for d in "${PROFILE_DIRS[@]}"; do
+    src="$FLATPAK_PROFILE/Default/$d"
+    if [[ -d "$src" ]]; then
+        cp -a "$src" "$DEB_PROFILE/Default/$d"
+        size=$(du -sh "$src" 2>/dev/null | cut -f1)
+        info "Copied: $d/ ($size)"
+        ((copied++))
+    else
+        ((skipped++))
+    fi
+done
+
+# --- Browser-level files (outside Default/) ---
+BROWSER_FILES=(
+    "Local State"
+    "First Run"
+)
+
+for f in "${BROWSER_FILES[@]}"; do
+    src="$FLATPAK_PROFILE/$f"
+    if [[ -e "$src" ]]; then
+        cp -a "$src" "$DEB_PROFILE/$f"
+        info "Copied: $f (browser-level)"
+        ((copied++))
+    fi
+done
+
+# --- NativeMessagingHosts (if any) ---
+if [[ -d "$FLATPAK_PROFILE/NativeMessagingHosts" ]]; then
+    cp -a "$FLATPAK_PROFILE/NativeMessagingHosts" "$DEB_PROFILE/NativeMessagingHosts"
+    info "Copied: NativeMessagingHosts/"
+    ((copied++))
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e " ${GREEN}Migration complete${NC}"
+echo " Copied: $copied items"
+echo " Skipped (not found): $skipped items"
+echo " Target: $DEB_PROFILE/Default/"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Password reminder
+if [[ -f "$PASSWORD_CSV" ]]; then
+    warn "PASSWORDS: Saved passwords won't work (different encryption key)."
+    echo "    After launching deb Chromium:"
+    echo "    1. Go to chrome://settings/passwords"
+    echo "    2. Click ⋮ (three dots) → Import passwords"
+    echo "    3. Select: $PASSWORD_CSV"
+    echo "    4. DELETE the CSV after import (it's plaintext!):"
+    echo "       rm \"$PASSWORD_CSV\""
+    echo ""
+else
+    warn "Password CSV not found at $PASSWORD_CSV"
+    echo "    If you exported it elsewhere, import manually via chrome://settings/passwords"
+    echo ""
+fi
+
+warn "Extensions are copied but may need to be re-enabled on first launch."
+echo ""

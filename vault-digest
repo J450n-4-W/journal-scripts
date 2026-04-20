@@ -1,0 +1,648 @@
+#!/bin/bash
+# vault-digest — Scan journal entries and propose updates to existing entity pages
+#
+# Phase 1 (scan):  Parse journal files in a date range, extract wikilinks with
+#                   context, cross-reference against existing pages, output context
+#                   files to staging. No LLM needed.
+#
+# Phase 2 (draft): Feed journal context + current page content to Claude to draft
+#                   append-only updates. Requires claude CLI.
+#
+# Phase 3 (apply): Review helper — shows diffs and cp commands for approved patches.
+#
+# Usage:
+#   vault-digest scan   [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N]
+#   vault-digest draft  [--limit N] [--dry-run] [--force]
+#   vault-digest apply  [--entity "Name"]
+#   vault-digest status
+#
+# Staging directory: ~/notebook-staging/digest/
+
+set -euo pipefail
+
+VAULT="$HOME/notebook"
+STAGING_DIR="$HOME/notebook-staging/digest"
+CONTEXT_DIR="$STAGING_DIR/context"
+CURRENT_DIR="$STAGING_DIR/current"
+PATCHES_DIR="$STAGING_DIR/patches"
+SCAN_FILE="$STAGING_DIR/scan.tsv"
+PROMPT_FILE="$STAGING_DIR/digest-prompt.txt"
+LOG_FILE="$STAGING_DIR/digest-log.txt"
+
+DAYS=7
+FROM_DATE=""
+TO_DATE=""
+LIMIT=0
+DRY_RUN=0
+FORCE=0
+ENTITY=""
+
+mkdir -p "$CONTEXT_DIR" "$CURRENT_DIR" "$PATCHES_DIR"
+
+# ─── Digest prompt ────────────────────────────────────────────────────────
+
+write_prompt() {
+  cat > "$PROMPT_FILE" << 'PROMPT'
+You are a research assistant helping a journalist maintain a PKM vault. You are updating an existing entity page with new information from recent journal entries.
+
+You will be given:
+- The page name
+- The CURRENT page content (everything already on the page)
+- NEW journal mentions (recent journal entries that reference this entity, with surrounding context preserved as LogSeq outline blocks)
+
+Your job is to produce an updated version of the page that appends new information without modifying existing content.
+
+Rules:
+
+1. PRESERVE all existing page content exactly as-is. Do not rewrite, reformat, reorder, or delete anything that is already on the page. Your output must begin with the existing content verbatim.
+
+2. APPEND new information after the existing content, in a clearly delimited section:
+
+   ## Recent activity
+
+   - [[2026_02_23]]: [1-2 sentence summary of what the journal entry says about this entity, with relevant [[wikilinks]] preserved]
+
+   Group entries by date. Use the journal page filename (without extension) as the wikilink for each entry.
+
+3. If the page already has a "## Recent activity" section, append new entries to it rather than creating a duplicate section.
+
+4. DEDUPLICATION: Before adding an entry, check if the same fact, event, or relationship is already mentioned anywhere on the page (in any section). If so, skip it. Only add genuinely new information. Be strict about this — if a journal entry merely re-states something the page already covers, do not add it.
+
+5. If none of the journal mentions contain information that is genuinely new (everything is already covered on the page), output the page UNCHANGED with no additions. Add a comment at the very end: <!-- vault-digest: no new information -->
+
+6. CONNECTIONS: If the journal entries reveal new entity relationships not already on the page, and the page has a "## Connections" section, append new entries to the appropriate subsection (People or Organisations). If the page lacks a Connections section, add one after the Recent activity section.
+
+7. Do not invent information not present in the journal mentions or current page.
+8. Do not include editorial commentary or assessment.
+9. Preserve all wikilinks from the journal context.
+10. Wikilink conventions:
+    - People: [[Firstname Lastname]]
+    - Organisations: [[Full Proper Name]]
+    - US places: [[City, State]]
+    - Non-US places: [[City, Country]]
+    - Dates: [[YYYY_MM_DD]]
+
+11. Output only the full updated page content. No wrapper text or explanation.
+PROMPT
+}
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+
+slug_for() {
+  echo "$1" | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 100
+}
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+# ─── Scan phase ────────────────────────────────────────────────────────────
+
+scan() {
+  echo "Scanning journal entries for entity mentions..."
+  log "=== scan started ==="
+
+  # Clear previous scan output (context + current snapshots)
+  rm -f "$SCAN_FILE"
+  rm -rf "$CONTEXT_DIR" "$CURRENT_DIR"
+  mkdir -p "$CONTEXT_DIR" "$CURRENT_DIR"
+
+  # Run the scan in Python
+  _FROM_DATE="$FROM_DATE" _TO_DATE="$TO_DATE" _DAYS="$DAYS" \
+  _VAULT="$VAULT" _CONTEXT_DIR="$CONTEXT_DIR" _CURRENT_DIR="$CURRENT_DIR" \
+  _SCAN_FILE="$SCAN_FILE" \
+  python3 << 'PYEOF'
+import os, re, sys, collections
+from datetime import datetime, timedelta
+
+VAULT = os.environ['_VAULT']
+CONTEXT_DIR = os.environ['_CONTEXT_DIR']
+CURRENT_DIR = os.environ['_CURRENT_DIR']
+SCAN_FILE = os.environ['_SCAN_FILE']
+
+from_str = os.environ.get('_FROM_DATE', '')
+to_str = os.environ.get('_TO_DATE', '')
+days = int(os.environ.get('_DAYS', '7'))
+
+# ── Resolve date range ──────────────────────────────────────────────────
+if from_str and to_str:
+    from_date = datetime.strptime(from_str, '%Y-%m-%d').date()
+    to_date = datetime.strptime(to_str, '%Y-%m-%d').date()
+elif from_str:
+    from_date = datetime.strptime(from_str, '%Y-%m-%d').date()
+    to_date = datetime.now().date()
+else:
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=days - 1)
+
+print(f"Date range: {from_date} to {to_date}")
+
+# ── Find matching journal files ─────────────────────────────────────────
+journals_dir = os.path.join(VAULT, 'journals')
+journal_files = []
+
+date_patterns = [
+    (re.compile(r'^(\d{4})_(\d{2})_(\d{2})\.md$'), '_'),
+    (re.compile(r'^(\d{4})-(\d{2})-(\d{2})\.md$'), '-'),
+]
+
+for fname in sorted(os.listdir(journals_dir)):
+    for pat, sep in date_patterns:
+        m = pat.match(fname)
+        if m:
+            try:
+                fdate = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+                if from_date <= fdate <= to_date:
+                    page_ref = fname[:-3]  # filename without .md
+                    journal_files.append((fdate, os.path.join(journals_dir, fname), page_ref))
+            except ValueError:
+                pass
+            break
+
+print(f"Found {len(journal_files)} journal files in range")
+
+if not journal_files:
+    print("No journal files found in date range.")
+    sys.exit(0)
+
+# ── Build set of existing page names ────────────────────────────────────
+existing_pages = {}  # lowercase name → actual filename (without .md)
+pages_dir = os.path.join(VAULT, 'pages')
+for root, dirs, files in os.walk(pages_dir):
+    dirs[:] = [d for d in dirs if not d.startswith('.')]
+    for f in files:
+        if f.endswith('.md'):
+            name = f[:-3]
+            existing_pages[name.lower()] = name
+
+print(f"Found {len(existing_pages)} existing pages")
+
+# ── Parse journal files and extract wikilinks with context ──────────────
+wikilink_re = re.compile(r'\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]')
+date_re = re.compile(r'^\d{4}[-_]\d{2}[-_]\d{2}$')
+
+# entity_name -> list of (journal_ref, context_block)
+entity_mentions = collections.defaultdict(list)
+
+def get_indent(line):
+    """Count leading tabs (LogSeq uses tabs for nesting)."""
+    count = 0
+    for ch in line:
+        if ch == '\t':
+            count += 1
+        elif ch == ' ':
+            # Some files use spaces; treat 2 spaces as one indent level
+            count += 0.5
+        else:
+            break
+    return int(count)
+
+def parse_journal(filepath, page_ref):
+    """Parse a LogSeq journal file and extract wikilinks with outline context."""
+    try:
+        with open(filepath, 'r', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception:
+        return
+
+    # For each line, record its indent level
+    parsed = []
+    for i, raw_line in enumerate(lines):
+        stripped = raw_line.rstrip('\n')
+        indent = get_indent(stripped)
+        content = stripped.lstrip('\t').lstrip()
+        # Strip LogSeq properties like "collapsed:: true"
+        if re.match(r'^\w+::\s', content):
+            parsed.append((indent, '', raw_line.rstrip('\n')))
+        else:
+            parsed.append((indent, content, raw_line.rstrip('\n')))
+
+    for i, (indent, content, raw) in enumerate(parsed):
+        if not content:
+            continue
+
+        # Find wikilinks in this line
+        for m in wikilink_re.finditer(content):
+            target = m.group(1).strip()
+            if not target:
+                continue
+            # Skip date references
+            if date_re.match(target):
+                continue
+            # Skip self-references
+            if target == page_ref:
+                continue
+
+            # Check if this entity has an existing page
+            if target.lower() not in existing_pages:
+                continue
+
+            canonical = existing_pages[target.lower()]
+
+            # Build context block: parent chain + this line + children
+            context_lines = []
+
+            # Walk up to find parent bullets
+            parents = []
+            current_indent = indent
+            for j in range(i - 1, -1, -1):
+                p_indent, p_content, p_raw = parsed[j]
+                if p_indent < current_indent and p_content:
+                    parents.append(p_raw)
+                    current_indent = p_indent
+                    if p_indent == 0:
+                        break
+
+            parents.reverse()
+            context_lines.extend(parents)
+
+            # This line
+            context_lines.append(raw)
+
+            # Walk down to find immediate children (one level deeper)
+            child_indent = indent + 1
+            for j in range(i + 1, len(parsed)):
+                c_indent, c_content, c_raw = parsed[j]
+                if c_indent <= indent:
+                    break  # Same or higher level — stop
+                if c_indent == child_indent and c_content:
+                    context_lines.append(c_raw)
+                elif c_indent > child_indent:
+                    # Grandchild — include for richer context
+                    context_lines.append(c_raw)
+
+            block = '\n'.join(context_lines)
+
+            # Filter: skip if context is just the bare wikilink
+            text_without_links = wikilink_re.sub('', block)
+            text_clean = re.sub(r'[-\t\s*#]', '', text_without_links).strip()
+            if len(text_clean) < 20:
+                continue
+
+            entity_mentions[canonical].append((page_ref, block))
+
+# Process all journal files
+for fdate, fpath, page_ref in sorted(journal_files):
+    parse_journal(fpath, page_ref)
+
+print(f"Found {len(entity_mentions)} entities with substantive mentions")
+
+# ── Write output ────────────────────────────────────────────────────────
+
+def make_slug(name):
+    slug = name.replace(' ', '-')
+    slug = re.sub(r'[^a-zA-Z0-9-]', '', slug)
+    return slug[:100]
+
+# Write scan.tsv
+with open(SCAN_FILE, 'w') as f:
+    for entity in sorted(entity_mentions.keys(), key=lambda e: len(entity_mentions[e]), reverse=True):
+        mentions = entity_mentions[entity]
+        dates = sorted(set(ref for ref, _ in mentions))
+        f.write(f"{entity}\t{len(mentions)}\t{','.join(dates)}\n")
+
+# Write context files
+for entity, mentions in entity_mentions.items():
+    slug = make_slug(entity)
+    ctx_path = os.path.join(CONTEXT_DIR, f"{slug}.txt")
+
+    # Group by journal date
+    by_date = collections.defaultdict(list)
+    for ref, block in mentions:
+        by_date[ref].append(block)
+
+    with open(ctx_path, 'w') as f:
+        for ref in sorted(by_date.keys()):
+            f.write(f"=== {ref} ===\n")
+            for block in by_date[ref]:
+                f.write(block + '\n\n')
+
+# Write current page snapshots
+for entity in entity_mentions:
+    slug = make_slug(entity)
+    # Find the actual page file
+    page_path = None
+    for root, dirs, files in os.walk(os.path.join(VAULT, 'pages')):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for fname in files:
+            if fname == entity + '.md':
+                page_path = os.path.join(root, fname)
+                break
+        if page_path:
+            break
+
+    if page_path and os.path.isfile(page_path):
+        cur_path = os.path.join(CURRENT_DIR, f"{slug}.txt")
+        with open(page_path, 'r', errors='ignore') as src:
+            content = src.read()
+        with open(cur_path, 'w') as dst:
+            dst.write(content)
+
+print(f"\nScan complete.")
+print(f"  Entities with mentions: {len(entity_mentions)}")
+print(f"  Journal files scanned: {len(journal_files)}")
+print(f"  Scan file: {SCAN_FILE}")
+print(f"  Context dir: {CONTEXT_DIR}")
+print(f"  Current page snapshots: {CURRENT_DIR}")
+print(f"\nRun 'vault-digest draft' to generate update patches.")
+PYEOF
+
+  write_prompt
+  log "scan complete"
+}
+
+# ─── Draft phase ──────────────────────────────────────────────────────────
+
+draft() {
+  if [ ! -f "$SCAN_FILE" ]; then
+    echo "Error: No scan file found. Run 'vault-digest scan' first."
+    exit 1
+  fi
+
+  local i=0
+  local drafted=0
+  local skipped=0
+  local no_new=0
+  local errors=0
+
+  log "=== draft started ==="
+
+  while IFS=$'\t' read -r entity count dates <&3; do
+    i=$((i + 1))
+
+    if [ "$LIMIT" -gt 0 ] && [ "$drafted" -ge "$LIMIT" ]; then
+      break
+    fi
+
+    local slug
+    slug=$(slug_for "$entity")
+    local context_file="$CONTEXT_DIR/${slug}.txt"
+    local current_file="$CURRENT_DIR/${slug}.txt"
+    local patch_file="$PATCHES_DIR/${entity}.md"
+
+    # Skip if already drafted (unless --force)
+    if [ -f "$patch_file" ] && [ "$FORCE" = "0" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Skip if no context
+    if [ ! -f "$context_file" ] || [ ! -s "$context_file" ]; then
+      continue
+    fi
+
+    # Skip if no current page snapshot
+    if [ ! -f "$current_file" ]; then
+      continue
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+      local ctx_size
+      ctx_size=$(du -h "$context_file" | cut -f1)
+      local cur_size
+      cur_size=$(du -h "$current_file" | cut -f1)
+      echo "WOULD DRAFT: $entity ($count mentions from $dates, context: $ctx_size, page: $cur_size)"
+      drafted=$((drafted + 1))
+      continue
+    fi
+
+    printf "[%d] Drafting: %s (%s mentions)... " "$i" "$entity" "$count"
+
+    # Build LLM input
+    local input_file
+    input_file=$(mktemp)
+
+    {
+      echo "Page name: ${entity}"
+      echo ""
+      echo "=== CURRENT PAGE CONTENT ==="
+      # For very large pages, truncate to first 200 + last 50 lines
+      local line_count
+      line_count=$(wc -l < "$current_file")
+      if [ "$line_count" -gt 500 ]; then
+        head -200 "$current_file"
+        echo ""
+        echo "[... ${line_count} total lines — middle truncated for context window ...]"
+        echo ""
+        tail -50 "$current_file"
+      else
+        cat "$current_file"
+      fi
+      echo ""
+      echo "=== NEW JOURNAL MENTIONS ==="
+      cat "$context_file"
+    } > "$input_file"
+
+    # Feed to Claude
+    if claude -p "$(cat "$PROMPT_FILE")" < "$input_file" > "$patch_file" 2>/dev/null; then
+      # Check for "no new information" marker
+      if grep -q 'vault-digest: no new information' "$patch_file" 2>/dev/null; then
+        echo "NO NEW INFO"
+        no_new=$((no_new + 1))
+      else
+        echo "OK ($(wc -l < "$patch_file") lines)"
+      fi
+      drafted=$((drafted + 1))
+    else
+      echo "ERROR"
+      rm -f "$patch_file"
+      errors=$((errors + 1))
+    fi
+
+    rm -f "$input_file"
+
+  done 3< "$SCAN_FILE"
+
+  echo ""
+  echo "=== Draft complete ==="
+  echo "Drafted: $drafted"
+  echo "Skipped (already exist): $skipped"
+  echo "No new information: $no_new"
+  echo "Errors: $errors"
+  echo "Patches directory: $PATCHES_DIR/"
+
+  log "draft complete: drafted=$drafted skipped=$skipped no_new=$no_new errors=$errors"
+}
+
+# ─── Apply helper ─────────────────────────────────────────────────────────
+
+apply() {
+  if [ -z "$ENTITY" ]; then
+    echo "Usage: vault-digest apply --entity \"Entity Name\""
+    echo ""
+    echo "Available patches:"
+    if [ -d "$PATCHES_DIR" ]; then
+      for f in "$PATCHES_DIR"/*.md; do
+        [ -f "$f" ] || continue
+        local name
+        name=$(basename "$f" .md)
+        # Check if it has the no-new-info marker
+        if grep -q 'vault-digest: no new information' "$f" 2>/dev/null; then
+          echo "  $name (no new information)"
+        else
+          echo "  $name"
+        fi
+      done
+    fi
+    return
+  fi
+
+  local patch_file="$PATCHES_DIR/${ENTITY}.md"
+  local page_file="$VAULT/pages/${ENTITY}.md"
+
+  if [ ! -f "$patch_file" ]; then
+    echo "No patch found for: $ENTITY"
+    echo "Run 'vault-digest draft' first, or check the entity name."
+    return 1
+  fi
+
+  if grep -q 'vault-digest: no new information' "$patch_file" 2>/dev/null; then
+    echo "Patch for '$ENTITY' contains no new information."
+    return 0
+  fi
+
+  if [ ! -f "$page_file" ]; then
+    echo "Warning: No existing page at $page_file"
+    echo "The patch would create a new file."
+    echo ""
+  fi
+
+  echo "=== Diff for: $ENTITY ==="
+  echo ""
+
+  if [ -f "$page_file" ]; then
+    diff --color=always -u "$page_file" "$patch_file" || true
+  else
+    echo "(New file — no diff available)"
+    echo ""
+    head -30 "$patch_file"
+    echo "..."
+  fi
+
+  echo ""
+  echo "To apply:"
+  echo "  cp $(printf '%q' "$patch_file") $(printf '%q' "$page_file")"
+}
+
+# ─── Status ───────────────────────────────────────────────────────────────
+
+status() {
+  echo "=== Vault Digest Status ==="
+  echo ""
+
+  if [ -f "$SCAN_FILE" ]; then
+    local total
+    total=$(wc -l < "$SCAN_FILE")
+    echo "Entities scanned: $total"
+  else
+    echo "Entities scanned: none (run 'vault-digest scan' first)"
+  fi
+
+  if [ -d "$CONTEXT_DIR" ]; then
+    local contexts
+    contexts=$(find "$CONTEXT_DIR" -name "*.txt" -size +0c 2>/dev/null | wc -l)
+    echo "Context files: $contexts"
+  fi
+
+  if [ -d "$CURRENT_DIR" ]; then
+    local snapshots
+    snapshots=$(find "$CURRENT_DIR" -name "*.txt" 2>/dev/null | wc -l)
+    echo "Page snapshots: $snapshots"
+  fi
+
+  if [ -d "$PATCHES_DIR" ]; then
+    local patches
+    patches=$(find "$PATCHES_DIR" -name "*.md" 2>/dev/null | wc -l)
+    local no_new=0
+    for f in "$PATCHES_DIR"/*.md; do
+      [ -f "$f" ] || continue
+      if grep -q 'vault-digest: no new information' "$f" 2>/dev/null; then
+        no_new=$((no_new + 1))
+      fi
+    done
+    local with_updates=$((patches - no_new))
+    echo "Patches drafted: $patches ($with_updates with updates, $no_new with no new info)"
+  fi
+
+  echo ""
+  echo "Staging directory: $STAGING_DIR/"
+
+  if [ -f "$LOG_FILE" ]; then
+    echo ""
+    echo "Last log entries:"
+    tail -3 "$LOG_FILE"
+  fi
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  scan)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --from) FROM_DATE="$2"; shift 2 ;;
+        --to) TO_DATE="$2"; shift 2 ;;
+        --days) DAYS="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    scan
+    ;;
+  draft)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --limit) LIMIT="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --force) FORCE=1; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    draft
+    ;;
+  apply)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --entity) ENTITY="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    apply
+    ;;
+  status)
+    status
+    ;;
+  help|--help|-h)
+    echo "vault-digest — Scan journal entries and propose updates to existing entity pages"
+    echo ""
+    echo "Usage:"
+    echo "  vault-digest scan   [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N]"
+    echo "  vault-digest draft  [--limit N] [--dry-run] [--force]"
+    echo "  vault-digest apply  [--entity \"Name\"]"
+    echo "  vault-digest status"
+    echo ""
+    echo "Phases:"
+    echo "  scan    Parse journal files, extract wikilinks with context,"
+    echo "          cross-reference against existing pages. No LLM needed."
+    echo "  draft   Feed context + current page to Claude, generate update patches."
+    echo "  apply   Review diffs and get cp commands for approved patches."
+    echo "  status  Show current state of the digest pipeline."
+    echo ""
+    echo "Options:"
+    echo "  --days N          Scan last N days of journals (default: 7)"
+    echo "  --from/--to       Explicit date range (YYYY-MM-DD)"
+    echo "  --limit N         Draft at most N patches"
+    echo "  --dry-run         Show what would be drafted without calling LLM"
+    echo "  --force           Re-draft patches even if they already exist"
+    echo "  --entity \"Name\"   Show diff/apply command for a specific entity"
+    echo ""
+    echo "Staging directory: ~/notebook-staging/digest/"
+    ;;
+  *)
+    echo "Unknown command: $CMD"
+    echo "Run 'vault-digest help' for usage."
+    exit 1
+    ;;
+esac

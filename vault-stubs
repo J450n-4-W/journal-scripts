@@ -1,0 +1,467 @@
+#!/bin/bash
+# vault-stubs — Gather context for unresolved links and generate stub pages
+#
+# Phase 1 (gather): Queries Obsidian CLI for unresolved links, filters candidates,
+#                    and gathers search context for each into a staging directory.
+#                    No LLM needed. Requires Obsidian to be running.
+#
+# Phase 2 (draft):  Feeds gathered context to Claude Code to draft stub pages.
+#                    Requires claude CLI.
+#
+# Usage:
+#   vault-stubs gather [--min-mentions N] [--limit N]
+#   vault-stubs draft  [--limit N] [--dry-run]
+#   vault-stubs status
+#
+# Staging directory: ~/notebook-staging/
+
+set -euo pipefail
+
+STAGING_DIR="$HOME/notebook-staging"
+CONTEXT_DIR="$STAGING_DIR/context"
+STUBS_DIR="$STAGING_DIR/stubs"
+CANDIDATES_FILE="$STAGING_DIR/candidates.tsv"
+PROMPT_FILE="$STAGING_DIR/stub-prompt.txt"
+MIN_MENTIONS="${MIN_MENTIONS:-5}"
+LIMIT="${LIMIT:-0}"  # 0 = no limit
+
+mkdir -p "$CONTEXT_DIR" "$STUBS_DIR"
+
+# ─── Stub drafting prompt ───────────────────────────────────────────────────
+
+write_prompt() {
+  cat > "$PROMPT_FILE" << 'PROMPT'
+You are a research assistant helping a journalist maintain a PKM vault. You are drafting a stub page for an entity that has been referenced across the vault but does not yet have its own page.
+
+You will be given:
+- The page name
+- Search results from across the vault showing every mention of this entity, with source file paths and surrounding context
+
+Your job is to draft a stub page that:
+
+1. Starts with YAML frontmatter:
+   ---
+   type: person | organisation | place | event
+   status: stub
+   ---
+
+   Determine the entity type from context. If unclear, use "person" for names, "organisation" for groups/companies/institutions.
+
+2. Opens with a 2-4 sentence summary synthesising what is known about this entity from the provided mentions. State facts, do not speculate. If the mentions are thin, write a shorter summary. Do not pad.
+
+3. Includes a "## Mentions" section listing each substantive mention with:
+   - A wikilink to the source file (using the filename without extension, in [[double brackets]])
+   - For journal pages like journals/2024_01_15.md use [[2024_01_15]]
+   - For pages like pages/Foo.md use [[Foo]]
+   - For Readwise clips use the full filename without extension
+   - The relevant context, condensed to 1-2 sentences per mention
+   - Chronological order if dates are apparent from filenames
+   - Skip duplicate mentions of the same fact from different copies of the same content
+   - For entities with many mentions, be selective: aim for the most informative mentions
+
+4. Includes a "## Connections" section listing other entities mentioned alongside this one in the source material, as [[wikilinks]]. Only include connections that appear substantive, not incidental. Organise into People and Organisations subsections if both are present.
+
+Rules:
+- Preserve all existing wikilinks found in the source context
+- People: [[Firstname Lastname]]
+- Organisations: full proper name [[Heritage Foundation]]
+- US places: [[City, State]]
+- Non-US places: [[City, Country]]
+- Do not invent information not present in the provided mentions
+- Do not include editorial commentary or assessment
+- Ignore mentions that are clearly about a different entity with a similar name (substring matches)
+- Output only the page content (frontmatter + body), no wrapper text or explanation
+PROMPT
+  echo "Wrote prompt to $PROMPT_FILE"
+}
+
+# ─── Gather phase ───────────────────────────────────────────────────────────
+
+gather() {
+  local min_mentions="$1"
+  local limit="$2"
+
+  echo "Scanning vault for unresolved wikilinks (min mentions: $min_mentions)..."
+
+  # Scan vault directly — no Obsidian CLI needed
+  _MIN_MENTIONS="$min_mentions" python3 << 'PYEOF' > "$CANDIDATES_FILE"
+import os, re, sys, collections
+
+VAULT = os.path.expanduser('~/notebook')
+min_n = int(os.environ['_MIN_MENTIONS'])
+
+# Build set of existing page names (case-insensitive)
+existing = set()
+for root, dirs, files in os.walk(VAULT):
+    dirs[:] = [d for d in dirs if not d.startswith('.')]
+    for f in files:
+        if f.endswith('.md'):
+            existing.add(f[:-3].lower())
+
+# Scan all .md files for [[wikilinks]]
+wikilink_re = re.compile(r'\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]')
+link_counts = collections.Counter()
+for root, dirs, files in os.walk(VAULT):
+    dirs[:] = [d for d in dirs if not d.startswith('.')]
+    for f in files:
+        if f.endswith('.md'):
+            try:
+                with open(os.path.join(root, f), 'r', errors='ignore') as fh:
+                    for m in wikilink_re.finditer(fh.read()):
+                        target = m.group(1).strip()
+                        if target and target.lower() not in existing:
+                            link_counts[target] += 1
+            except Exception:
+                pass
+
+def is_noise(link):
+    if re.search(r'\.\w{2,4}$', link) and not link.endswith('.md'):
+        return True
+    if any(p in link for p in ['http', 'www.', '../', 'assets/', '/', '@', '#', '%']):
+        return True
+    if re.match(r'^[\d\s\-_.,]+$', link):
+        return True
+    if re.match(r'^\d{4}[-_]\d{2}[-_]\d{2}', link):
+        return True
+    if re.match(r'^\d{5}$', link):
+        return True
+    if re.search(r'\d+\s+(S|N|E|W|St|Ave|Blvd|Dr|Rd|Ct|Ln|Way|Ste|Suite|PO)\b', link):
+        return True
+    if len(link) <= 2:
+        return True
+    if any(p in link for p in ['{', '}', '[', ']', '"']):
+        return True
+    if re.search(r' [-|] [A-Z][\w\s]+$', link) and len(link) > 40:
+        return True
+    if len(link.split()) >= 5 and any(w in link.split() for w in ['the', 'to', 'for', 'and', 'in', 'of', 'a']):
+        if not re.match(r'^[A-Z][\w]+,\s+[A-Z][\w]+$', link):
+            if len(link) > 50:
+                return True
+    if re.search(r'\([^)]{3,}\)$', link):
+        return True
+    wiki_patterns = [
+        r' in the United States$', r' of the United States$', r'^United States ',
+        r' presidential election$', r' invasion of ', r' interference in ',
+        r' conspiracy theory',
+    ]
+    if any(re.search(p, link) for p in wiki_patterns):
+        return True
+    if link in ('Music', 'Books', 'FAA', 'HDF', 'CPI', 'thinktank'):
+        return True
+    if link.endswith('.industries') or link.endswith('.io') or link.endswith('.com'):
+        return True
+    return False
+
+def normalize_underscore(link):
+    org_markers = ('LLC', 'Corp', 'Inc', 'Associates', 'Foundation', 'Trust',
+                   'Holdings', 'Agency', 'Media', 'Construction', 'Group')
+    if '_' not in link:
+        return link, False
+    parts = link.split('_')
+    if any(p in org_markers for p in parts):
+        return link.replace('_', ' '), True
+    if len(parts) == 2 and parts[0][0:1].isupper() and parts[1][0:1].isupper():
+        return f'{parts[1]} {parts[0]}', True
+    if len(parts) == 3 and len(parts[2]) <= 2 and parts[0][0:1].isupper():
+        return f'{parts[1]} {parts[2]} {parts[0]}', True
+    if len(parts) == 3 and parts[2] in ('Jr', 'Sr', 'III', 'II', 'IV'):
+        return f'{parts[1]} {parts[0]} {parts[2]}', True
+    if len(parts) == 4 and parts[3] in ('Jr', 'Sr', 'III', 'II', 'IV') and len(parts[2]) <= 2:
+        return f'{parts[1]} {parts[2]} {parts[0]} {parts[3]}', True
+    return link.replace('_', ' '), True
+
+# Filter and normalize
+raw = {}
+for link, count in link_counts.items():
+    if count >= min_n and not is_noise(link):
+        raw[link] = count
+
+merged = {}
+aliases = {}
+for link, count in raw.items():
+    normalized, was_converted = normalize_underscore(link)
+    if was_converted and normalized != link:
+        if normalized in merged:
+            merged[normalized] += count
+        elif normalized in raw:
+            merged[normalized] = raw[normalized] + count
+        else:
+            merged[normalized] = count
+        aliases.setdefault(normalized, []).append(link)
+    else:
+        if link not in merged:
+            merged[link] = count
+
+candidates = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+for link, count in candidates:
+    alias_str = ''
+    if link in aliases:
+        alias_str = '\t' + ','.join(aliases[link])
+    print(f'{count}\t{link}{alias_str}')
+PYEOF
+
+  local total
+  total=$(wc -l < "$CANDIDATES_FILE")
+  echo "Found $total candidates"
+
+  if [ "$limit" -gt 0 ] && [ "$limit" -lt "$total" ]; then
+    echo "Limiting to top $limit by mention count"
+    head -n "$limit" "$CANDIDATES_FILE" > "${CANDIDATES_FILE}.tmp"
+    mv "${CANDIDATES_FILE}.tmp" "$CANDIDATES_FILE"
+    total="$limit"
+  fi
+
+  echo ""
+  echo "Gathering search context for each candidate..."
+
+  local i=0
+  local skipped=0
+  while IFS=$'\t' read -r count link _aliases <&3; do
+    i=$((i + 1))
+    local slug
+    slug=$(echo "$link" | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 100)
+    local context_file="$CONTEXT_DIR/${slug}.txt"
+
+    # Skip if already gathered
+    if [ -f "$context_file" ] && [ -s "$context_file" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    printf "\r  [%d/%d] %s" "$i" "$total" "$link"
+
+    # Grep vault directly for context around each mention
+    # Search for main name + any alias forms (underscore variants)
+    local search_aliases="${_aliases:-}"
+    python3 -c "
+import subprocess, os, sys
+
+VAULT = os.path.expanduser('~/notebook')
+main_query = sys.argv[1]
+alias_arg = sys.argv[2] if len(sys.argv) > 2 else ''
+
+# Build list of search terms: main name + aliases
+queries = [main_query]
+if alias_arg:
+    queries.extend(alias_arg.split(','))
+
+# Find all .md files mentioning any form
+all_files = set()
+for q in queries:
+    result = subprocess.run(
+        ['grep', '-rli', '--include=*.md', '--', q, VAULT],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.stdout.strip():
+        all_files.update(result.stdout.strip().split('\n'))
+
+if not all_files:
+    sys.exit(0)
+
+# Build combined grep pattern (any form)
+import re
+pattern = '|'.join(re.escape(q) for q in queries)
+
+files = sorted(all_files)[:50]
+for full in files:
+    rel = os.path.relpath(full, VAULT)
+    print(f'=== {rel} ===')
+    try:
+        ctx = subprocess.run(
+            ['grep', '-i', '-n', '-C', '3', '-E', '--', pattern, full],
+            capture_output=True, text=True, timeout=5
+        )
+        if ctx.stdout:
+            lines = ctx.stdout.strip().split('\n')
+            print('\n'.join(lines[:60]))
+            if len(lines) > 60:
+                print(f'... ({len(lines) - 60} more lines)')
+    except Exception:
+        pass
+    print()
+" "$link" "$search_aliases" > "$context_file" 2>/dev/null
+    sleep 0.1
+  done 3< "$CANDIDATES_FILE"
+
+  echo ""
+  echo ""
+  echo "=== Gather complete ==="
+  echo "Candidates: $total"
+  echo "Skipped (already gathered): $skipped"
+  echo "Context files: $CONTEXT_DIR/"
+  echo "Candidate list: $CANDIDATES_FILE"
+
+  # Write the prompt file
+  write_prompt
+}
+
+# ─── Draft phase ────────────────────────────────────────────────────────────
+
+draft() {
+  local limit="$1"
+  local dry_run="$2"
+
+  if [ ! -f "$CANDIDATES_FILE" ]; then
+    echo "Error: No candidates file. Run 'vault-stubs gather' first."
+    exit 1
+  fi
+
+  local i=0
+  local drafted=0
+  local skipped=0
+  local errors=0
+
+  while IFS=$'\t' read -r count link _aliases <&3; do
+    i=$((i + 1))
+
+    if [ "$limit" -gt 0 ] && [ "$drafted" -ge "$limit" ]; then
+      break
+    fi
+
+    local slug
+    slug=$(echo "$link" | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 100)
+    local context_file="$CONTEXT_DIR/${slug}.txt"
+    local stub_file="$STUBS_DIR/${link}.md"
+
+    # Skip if already drafted
+    if [ -f "$stub_file" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Skip if no context gathered
+    if [ ! -f "$context_file" ] || [ ! -s "$context_file" ]; then
+      continue
+    fi
+
+    if [ "$dry_run" = "1" ]; then
+      echo "WOULD DRAFT: $link ($count mentions, context: $(du -h "$context_file" | cut -f1))"
+      drafted=$((drafted + 1))
+      continue
+    fi
+
+    printf "[%d] Drafting: %s (%s mentions)... " "$i" "$link" "$count"
+
+    # Build input for Claude
+    local input_file
+    input_file=$(mktemp)
+    {
+      echo "Page name: ${link}"
+      echo ""
+      echo "Mentions from vault search:"
+      cat "$context_file"
+    } > "$input_file"
+
+    # Feed to Claude Code
+    if claude -p "$(cat "$PROMPT_FILE")" < "$input_file" > "$stub_file" 2>/dev/null; then
+      # Verify it looks like a valid stub (starts with ---)
+      if head -1 "$stub_file" | grep -q '^---'; then
+        echo "OK ($(wc -l < "$stub_file") lines)"
+        drafted=$((drafted + 1))
+      else
+        echo "WARN: output doesn't look like frontmatter, keeping for review"
+        drafted=$((drafted + 1))
+      fi
+    else
+      echo "ERROR"
+      rm -f "$stub_file"
+      errors=$((errors + 1))
+    fi
+
+    rm -f "$input_file"
+
+  done 3< "$CANDIDATES_FILE"
+
+  echo ""
+  echo "=== Draft complete ==="
+  echo "Drafted: $drafted"
+  echo "Skipped (already exist): $skipped"
+  echo "Errors: $errors"
+  echo "Stubs directory: $STUBS_DIR/"
+  echo ""
+  echo "Review stubs, then move approved ones to the vault:"
+  echo "  cp ~/notebook-staging/stubs/\"Entity Name.md\" ~/notebook/pages/"
+}
+
+# ─── Status ─────────────────────────────────────────────────────────────────
+
+status() {
+  echo "=== Vault Stubs Status ==="
+  echo ""
+
+  if [ -f "$CANDIDATES_FILE" ]; then
+    local total
+    total=$(wc -l < "$CANDIDATES_FILE")
+    echo "Candidates: $total"
+  else
+    echo "Candidates: none (run 'vault-stubs gather' first)"
+  fi
+
+  if [ -d "$CONTEXT_DIR" ]; then
+    local contexts
+    contexts=$(find "$CONTEXT_DIR" \( -name "*.json" -o -name "*.txt" \) -size +0c | wc -l)
+    echo "Context files gathered: $contexts"
+  fi
+
+  if [ -d "$STUBS_DIR" ]; then
+    local stubs
+    stubs=$(find "$STUBS_DIR" -name "*.md" | wc -l)
+    echo "Stubs drafted: $stubs"
+  fi
+
+  echo ""
+  echo "Staging directory: $STAGING_DIR/"
+}
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  gather)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --min-mentions) MIN_MENTIONS="$2"; shift 2 ;;
+        --limit) LIMIT="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    gather "$MIN_MENTIONS" "$LIMIT"
+    ;;
+  draft)
+    DRY_RUN=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --limit) LIMIT="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    draft "$LIMIT" "$DRY_RUN"
+    ;;
+  status)
+    status
+    ;;
+  help|--help|-h)
+    echo "Usage:"
+    echo "  vault-stubs gather [--min-mentions N] [--limit N]"
+    echo "  vault-stubs draft  [--limit N] [--dry-run]"
+    echo "  vault-stubs status"
+    echo ""
+    echo "Phase 1 (gather): Query Obsidian CLI for unresolved links, filter,"
+    echo "                   and gather search context. No LLM needed."
+    echo "Phase 2 (draft):  Feed context to Claude to draft stub pages."
+    echo ""
+    echo "Environment:"
+    echo "  MIN_MENTIONS  Minimum mention count (default: 5)"
+    echo "  LIMIT         Max candidates to process (default: 0 = all)"
+    echo ""
+    echo "Staging directory: ~/notebook-staging/"
+    ;;
+  *)
+    echo "Unknown command: $CMD"
+    echo "Run 'vault-stubs help' for usage."
+    exit 1
+    ;;
+esac
