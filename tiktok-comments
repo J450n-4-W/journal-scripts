@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""
+tiktok-comments — pull comments (and replies) from a TikTok video via TikTok's
+own web JSON endpoints, instead of scraping the rendered comment panel.
+
+Why this exists: the browser-extension / DOM route is capped by how TikTok
+renders comments (a virtualised window of ~10-15 nodes, reply expanders that
+yield 2-3 replies per click and one XHR each, and a server-side 403 on bursts).
+The endpoints behind that UI serve 50 comments per request and a whole reply
+thread in one or two, need no cookies and no request signing.
+
+Both endpoints stop early. TikTok reports a top-level `total` but refuses to
+paginate past roughly 4,000-4,500 comments, so on a big video a chunk of the
+thread is not retrievable by any method. This tool reports what it could not
+get rather than presenting a partial pull as complete.
+
+Usage:
+  tiktok-comments <url|aweme_id> [options]
+
+  -o, --out PATH        write to PATH (default: <id>-comments.md)
+      --json            also write raw API JSON alongside the markdown
+      --replies MODE    none | top | all   (default: top)
+      --reply-min N     with --replies top, only expand threads with >= N
+                        replies (default: 3)
+      --max N           stop after N top-level comments
+      --delay SECS      base pacing between requests (default: 1.2)
+      --sort MODE       api | likes | time  (default: api = TikTok's own order)
+      --quiet           suppress progress output
+
+Examples:
+  tiktok-comments https://www.tiktok.com/@life_with_madi/video/7672551955146886418
+  tiktok-comments 7672551955146886418 --replies all -o madi-full.md
+  tiktok-comments <url> --replies top --reply-min 10 --sort likes
+"""
+
+import argparse
+import http.client
+import json
+import os
+import random
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+API = "https://www.tiktok.com/api/comment/list/"
+API_REPLY = "https://www.tiktok.com/api/comment/list/reply/"
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+)
+PAGE = 50          # honoured by the endpoint; larger values are clamped
+MAX_BACKOFF = 60.0
+
+
+def log(msg, quiet=False):
+    if not quiet:
+        print(msg, file=sys.stderr, flush=True)
+
+
+def parse_id(s):
+    """Accept a full URL, a vm.tiktok short link, or a bare aweme_id."""
+    s = s.strip()
+    if re.fullmatch(r"\d{15,25}", s):
+        return s
+    m = re.search(r"/video/(\d{15,25})", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"/photo/(\d{15,25})", s)
+    if m:
+        return m.group(1)
+    if "vm.tiktok.com" in s or "vt.tiktok.com" in s:
+        req = urllib.request.Request(s, headers={"User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return parse_id(r.geturl())
+        except urllib.error.URLError as e:
+            sys.exit(f"could not resolve short link {s}: {e}")
+    sys.exit(f"could not find an aweme_id in: {s!r}")
+
+
+def fetch(url, params, delay, quiet=False, attempt_budget=5):
+    """GET with jittered pacing and exponential backoff on 403/429/5xx."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        f"{url}?{qs}",
+        headers={
+            "User-Agent": UA,
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-GB,en;q=0.9",
+        },
+    )
+    wait = delay
+    for attempt in range(attempt_budget):
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                body = r.read()
+            if not body:
+                return None
+            return json.loads(body)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429) or e.code >= 500:
+                if attempt == attempt_budget - 1:
+                    log(f"  ! HTTP {e.code} — giving up on this request", quiet)
+                    return None
+                wait = min(wait * 2 if attempt else max(wait, 5.0), MAX_BACKOFF)
+                log(f"  ! HTTP {e.code} — backing off {wait:.0f}s", quiet)
+                time.sleep(wait)
+                continue
+            log(f"  ! HTTP {e.code} — {e.reason}", quiet)
+            return None
+        # OSError covers URLError, socket timeouts and connection resets;
+        # http.client.HTTPException covers IncompleteRead on chunked responses,
+        # which TikTok throws fairly often on large pages.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as e:
+            if attempt == attempt_budget - 1:
+                log(f"  ! {type(e).__name__}: {e} — giving up on this request",
+                    quiet)
+                return None
+            wait = min(max(wait, 3.0) * 2, MAX_BACKOFF)
+            log(f"  ! {type(e).__name__} — retrying in {wait:.0f}s", quiet)
+            time.sleep(wait)
+    return None
+
+
+def pace(delay):
+    time.sleep(delay * random.uniform(0.75, 1.4))
+
+
+def norm_comment(c):
+    u = c.get("user") or {}
+    return {
+        "cid": c.get("cid"),
+        "user": u.get("unique_id") or u.get("nickname") or "unknown",
+        "nickname": u.get("nickname") or "",
+        "text": (c.get("text") or "").strip(),
+        "likes": c.get("digg_count") or 0,
+        "time": c.get("create_time") or 0,
+        "reply_total": c.get("reply_comment_total") or 0,
+        "pinned": bool(c.get("author_pin")),
+        "author_liked": bool(c.get("is_author_digged")),
+        "replies": [],
+    }
+
+
+def get_top_level(aweme_id, delay, cap, quiet, checkpoint=None):
+    """Paginate the top-level list until TikTok stops serving."""
+    out, seen, cursor = [], set(), 0
+    claimed = None
+    stop = None
+    pages = 0
+    while True:
+        d = fetch(API, {
+            "aweme_id": aweme_id, "count": PAGE, "cursor": cursor, "aid": 1988,
+        }, delay, quiet)
+        if d is None:
+            stop = f"request failed at cursor {cursor}"
+            break
+        if claimed is None:
+            claimed = d.get("total")
+        batch = d.get("comments") or []
+        if not batch:
+            stop = ("TikTok returned an empty page and stopped serving "
+                    f"(cursor {cursor}, has_more={d.get('has_more')})")
+            break
+        new = 0
+        for c in batch:
+            if c.get("no_show"):
+                continue
+            cid = c.get("cid")
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(norm_comment(c))
+            new += 1
+        log(f"  top-level: {len(out)} (cursor {cursor}, +{new})", quiet)
+        pages += 1
+        if checkpoint and pages % 20 == 0:
+            checkpoint(out)
+        if cap and len(out) >= cap:
+            out = out[:cap]
+            stop = f"stopped at --max {cap}"
+            break
+        if not d.get("has_more"):
+            stop = "TikTok set has_more=0"
+            break
+        nxt = d.get("cursor")
+        cursor = nxt if isinstance(nxt, int) and nxt > cursor else cursor + len(batch)
+        pace(delay)
+    return out, claimed, stop
+
+
+def get_replies(aweme_id, comment, delay, quiet):
+    """Paginate one reply thread. Returns (replies, truncated_bool)."""
+    got, seen, cursor = [], set(), 0
+    while True:
+        d = fetch(API_REPLY, {
+            "item_id": aweme_id, "comment_id": comment["cid"],
+            "count": PAGE, "cursor": cursor, "aid": 1988,
+        }, delay, quiet)
+        if d is None:
+            return got, True
+        batch = d.get("comments") or []
+        if not batch:
+            return got, bool(d.get("has_more"))
+        for r in batch:
+            if r.get("no_show"):
+                continue
+            cid = r.get("cid")
+            if cid in seen:
+                continue
+            seen.add(cid)
+            got.append(norm_comment(r))
+        if not d.get("has_more"):
+            return got, False
+        nxt = d.get("cursor")
+        cursor = nxt if isinstance(nxt, int) and nxt > cursor else cursor + len(batch)
+        pace(delay)
+
+
+def ts(epoch):
+    if not epoch:
+        return ""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def render(aweme_id, url, comments, claimed, stop, reply_mode, reply_min,
+           reply_notes, sort_mode, capped=False):
+    got_top = len(comments)
+    got_replies = sum(len(c["replies"]) for c in comments)
+    known_replies = sum(c["reply_total"] for c in comments)
+    pulled_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    L = []
+    L.append(f"# TikTok comments — {aweme_id}")
+    L.append("")
+    L.append(f"- Source: {url}")
+    L.append(f"- Retrieved: {pulled_at}")
+    L.append(f"- Top-level retrieved: **{got_top}**")
+    if claimed:
+        if capped:
+            L.append(f"- Top-level claimed by TikTok: {claimed} — run was "
+                     "capped with `--max`, so this is a deliberate subset, not "
+                     "the retrievable ceiling")
+        elif got_top < claimed:
+            pct = 100.0 * got_top / claimed
+            L.append(f"- Top-level claimed by TikTok: **{claimed}** "
+                     f"— retrieved {pct:.0f}%")
+            L.append(f"- **Not retrievable:** {claimed - got_top} top-level "
+                     "comments. TikTok stops paginating its own comment "
+                     "endpoint well before the reported total; the remainder "
+                     "cannot be reached by scrolling either, since the web UI "
+                     "is fed by the same endpoint.")
+        else:
+            L.append(f"- Top-level claimed by TikTok: {claimed} — complete")
+    L.append(f"- Replies retrieved: **{got_replies}** of {known_replies} "
+             "reported across the threads above")
+    if reply_mode == "none":
+        L.append("- Reply expansion: skipped (`--replies none`)")
+    elif reply_mode == "top":
+        L.append(f"- Reply expansion: threads with >= {reply_min} replies only "
+                 "(`--replies top`)")
+    else:
+        L.append("- Reply expansion: all threads (`--replies all`)")
+    if stop:
+        L.append(f"- Pagination ended because: {stop}")
+    if reply_notes:
+        L.append(f"- **{len(reply_notes)} reply thread(s) truncated** "
+                 "(rate limit or TikTok's own reply ceiling): "
+                 + ", ".join(f"@{u}" for u in reply_notes[:12])
+                 + (" …" if len(reply_notes) > 12 else ""))
+    L.append(f"- Order: {sort_mode}")
+    L.append("")
+    L.append("Counts above are top-level only, which is also what TikTok's "
+             "displayed comment count reflects. Replies are additional and "
+             "are not included in that figure.")
+    L.append("")
+    L.append("---")
+    L.append("")
+
+    for i, c in enumerate(comments, 1):
+        marks = []
+        if c["pinned"]:
+            marks.append("PINNED")
+        if c["author_liked"]:
+            marks.append("liked by creator")
+        mark = f" [{', '.join(marks)}]" if marks else ""
+        meta = f"({c['likes']} likes, {ts(c['time'])})" if c["likes"] or c["time"] else ""
+        L.append(f"{i}. [{c['user']}]{mark}: {c['text']}  {meta}".rstrip())
+        shown = len(c["replies"])
+        for r in c["replies"]:
+            rmeta = f"({r['likes']} likes)" if r["likes"] else ""
+            L.append(f"   ↳ [{r['user']}]: {r['text']}  {rmeta}".rstrip())
+        if c["reply_total"] > shown:
+            L.append(f"   ↳ … {c['reply_total'] - shown} further repl"
+                     f"{'y' if c['reply_total'] - shown == 1 else 'ies'} not retrieved")
+        L.append("")
+    return "\n".join(L)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="tiktok-comments", add_help=True,
+        description="Pull TikTok comments and replies via TikTok's web JSON API.")
+    p.add_argument("target", help="video URL or bare aweme_id")
+    p.add_argument("-o", "--out")
+    p.add_argument("--json", action="store_true",
+                   help="also write the normalised structure as JSON")
+    p.add_argument("--replies", choices=("none", "top", "all"), default="top")
+    p.add_argument("--reply-min", type=int, default=3)
+    p.add_argument("--max", type=int, default=0)
+    p.add_argument("--delay", type=float, default=1.2)
+    p.add_argument("--sort", choices=("api", "likes", "time"), default="api")
+    p.add_argument("--quiet", action="store_true")
+    a = p.parse_args()
+
+    aweme_id = parse_id(a.target)
+    url = (a.target if a.target.startswith("http")
+           else f"https://www.tiktok.com/@/video/{aweme_id}")
+    log(f"video {aweme_id}", a.quiet)
+
+    out = a.out or f"{aweme_id}-comments.md"
+    partial = out.rsplit(".", 1)[0] + ".partial.json"
+
+    def checkpoint(rows):
+        """Long runs are cheap to lose and expensive to redo — snapshot as we go."""
+        try:
+            with open(partial, "w", encoding="utf-8") as f:
+                json.dump({"aweme_id": aweme_id, "comments": rows}, f,
+                          ensure_ascii=False)
+        except OSError:
+            pass
+
+    log("collecting top-level comments…", a.quiet)
+    comments, claimed, stop = [], None, None
+    try:
+        comments, claimed, stop = get_top_level(
+            aweme_id, a.delay, a.max, a.quiet, checkpoint)
+    except Exception as e:                              # noqa: BLE001
+        stop = f"aborted by {type(e).__name__}: {e}"
+        log(f"  ! {stop}", a.quiet)
+        if os.path.exists(partial):
+            with open(partial, encoding="utf-8") as f:
+                comments = json.load(f).get("comments") or []
+            log(f"  recovered {len(comments)} from checkpoint", a.quiet)
+    if not comments:
+        sys.exit("no comments retrieved — comments may be disabled, the video "
+                 "removed, or the request blocked")
+
+    reply_notes = []
+    if a.replies != "none":
+        if a.replies == "all":
+            todo = [c for c in comments if c["reply_total"] > 0]
+        else:
+            todo = [c for c in comments if c["reply_total"] >= a.reply_min]
+        todo.sort(key=lambda c: -c["reply_total"])
+        log(f"expanding {len(todo)} reply thread(s) "
+            f"({sum(c['reply_total'] for c in todo)} replies reported)…", a.quiet)
+        for n, c in enumerate(todo, 1):
+            try:
+                reps, truncated = get_replies(aweme_id, c, a.delay, a.quiet)
+            except Exception as e:                      # noqa: BLE001
+                log(f"  ! @{c['user']}: {type(e).__name__} — skipped", a.quiet)
+                reply_notes.append(c["user"])
+                continue
+            c["replies"] = reps
+            if truncated:
+                reply_notes.append(c["user"])
+            log(f"  [{n}/{len(todo)}] @{c['user']}: {len(reps)}/{c['reply_total']}"
+                + (" (truncated)" if truncated else ""), a.quiet)
+            pace(a.delay)
+
+    if a.sort == "likes":
+        comments.sort(key=lambda c: (-c["likes"], c["time"]))
+    elif a.sort == "time":
+        comments.sort(key=lambda c: c["time"])
+
+    capped = bool(a.max) and len(comments) >= a.max
+    md = render(aweme_id, url, comments, claimed, stop, a.replies,
+                a.reply_min, reply_notes, a.sort, capped)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(md)
+    log(f"\nwrote {out}", a.quiet)
+    if os.path.exists(partial):
+        os.remove(partial)
+
+    if a.json:
+        jout = out.rsplit(".", 1)[0] + ".json"
+        with open(jout, "w", encoding="utf-8") as f:
+            json.dump({
+                "aweme_id": aweme_id, "url": url,
+                "claimed_top_level": claimed,
+                "retrieved_top_level": len(comments),
+                "retrieved_replies": sum(len(c["replies"]) for c in comments),
+                "pagination_stopped_because": stop,
+                "comments": comments,
+            }, f, indent=2, ensure_ascii=False)
+        log(f"wrote {jout}", a.quiet)
+
+    got_r = sum(len(c["replies"]) for c in comments)
+    print(f"{len(comments)} top-level + {got_r} replies -> {out}")
+    if claimed and len(comments) < claimed and not capped:
+        print(f"NOTE: TikTok claims {claimed} top-level comments and served "
+              f"{len(comments)}. The remaining {claimed - len(comments)} are "
+              "not retrievable — see the header in the output file.",
+              file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\ninterrupted")
