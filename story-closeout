@@ -16,7 +16,11 @@ set -euo pipefail
 VAULT="$HOME/notebook"
 ARCHIVE="$VAULT/archive"
 ASSETS="$VAULT/assets"
-MEDIA_ARCHIVE="/media/jason/4tb-external1/Reporting_Media_Archive"
+# Resolve the external SSD by LABEL so a shifted mountpoint (…/4tb-external vs
+# …/4tb-external1, e.g. when a stale mountpoint dir shadows the clean name) can't
+# misdirect the move to the wrong (possibly root-owned) path.
+EXT_MOUNT="$(findmnt -rno TARGET LABEL=4tb-external 2>/dev/null | head -1)"
+MEDIA_ARCHIVE="${EXT_MOUNT:-/media/jason/4tb-external1}/Reporting_Media_Archive"
 
 usage() {
     echo "Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM]"
@@ -200,9 +204,9 @@ media_files="$(find "$STORY_DIR" \( \
     \) -type f || true)"
 
 if [[ -n "$media_files" ]]; then
-    if [[ ! -d "/media/jason/4tb-external1" ]]; then
-        echo "Media: ⚠ 4TB SSD not mounted at /media/jason/4tb-external1 — SKIPPING media move"
-        echo "  Run again when drive is mounted, or move manually to $MEDIA_DEST/"
+    if [[ -z "$EXT_MOUNT" || ! -w "$EXT_MOUNT" ]]; then
+        echo "Media: ⚠ external SSD (LABEL=4tb-external) not mounted/writable — SKIPPING media move"
+        echo "  Run again when the drive is mounted, or move manually to $MEDIA_DEST/"
     else
         mkdir -p "$MEDIA_DEST"
         while IFS= read -r f; do
