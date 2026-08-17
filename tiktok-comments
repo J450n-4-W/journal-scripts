@@ -19,7 +19,9 @@ Usage:
 
   -o, --out PATH        write to PATH (default: <id>-comments.md)
       --json            also write raw API JSON alongside the markdown
-      --replies MODE    none | top | all   (default: top)
+      --replies MODE    none | top | all | auto  (default: auto — takes
+                        every thread when the volume is small, else falls
+                        back to the --reply-min threshold)
       --reply-min N     with --replies top, only expand threads with >= N
                         replies (default: 3)
       --max N           stop after N top-level comments
@@ -54,6 +56,8 @@ UA = (
 )
 PAGE = 50          # honoured by the endpoint; larger values are clamped
 MAX_BACKOFF = 60.0
+CEILING_HINT = 3500    # above this, a short pull is TikTok's pagination ceiling
+AUTO_REPLY_BUDGET = 1200   # --replies auto: expand every thread under this many
 
 
 def log(msg, quiet=False):
@@ -250,11 +254,22 @@ def render(aweme_id, url, comments, claimed, stop, reply_mode, reply_min,
             pct = 100.0 * got_top / claimed
             L.append(f"- Top-level claimed by TikTok: **{claimed}** "
                      f"— retrieved {pct:.0f}%")
-            L.append(f"- **Not retrievable:** {claimed - got_top} top-level "
-                     "comments. TikTok stops paginating its own comment "
-                     "endpoint well before the reported total; the remainder "
-                     "cannot be reached by scrolling either, since the web UI "
-                     "is fed by the same endpoint.")
+            # Two different causes, and the distinction matters in copy: near the
+            # ceiling TikTok is withholding comments it holds, whereas a small
+            # thread's gap is comments counted in `total` that no longer exist.
+            if got_top >= CEILING_HINT:
+                L.append(f"- **Not retrievable:** {claimed - got_top} top-level "
+                         "comments. TikTok stops paginating its own comment "
+                         "endpoint around 4,000–4,500 however large the total; "
+                         "the remainder cannot be reached by scrolling either, "
+                         "since the web UI is fed by the same endpoint.")
+            else:
+                L.append(f"- **Not served:** {claimed - got_top} top-level "
+                         "comments. The endpoint reported no more to give well "
+                         "short of its own total, which normally means those "
+                         "comments were deleted, hidden by the creator, or "
+                         "filtered — not that TikTok is withholding them. Do "
+                         "not describe them as suppressed or missing.")
         else:
             L.append(f"- Top-level claimed by TikTok: {claimed} — complete")
     L.append(f"- Replies retrieved: **{got_replies}** of {known_replies} "
@@ -310,7 +325,8 @@ def main():
     p.add_argument("-o", "--out")
     p.add_argument("--json", action="store_true",
                    help="also write the normalised structure as JSON")
-    p.add_argument("--replies", choices=("none", "top", "all"), default="top")
+    p.add_argument("--replies", choices=("none", "top", "all", "auto"),
+                   default="auto")
     p.add_argument("--reply-min", type=int, default=3)
     p.add_argument("--max", type=int, default=0)
     p.add_argument("--delay", type=float, default=1.2)
@@ -352,8 +368,16 @@ def main():
                  "removed, or the request blocked")
 
     reply_notes = []
-    if a.replies != "none":
-        if a.replies == "all":
+    mode = a.replies
+    if mode == "auto":
+        # Small and mid-size threads cost little to take whole, and the 2-4 reply
+        # exchanges are often the most quotable part. Only fall back to a
+        # threshold when the volume would run long.
+        pending = sum(c["reply_total"] for c in comments)
+        mode = "all" if pending <= AUTO_REPLY_BUDGET else "top"
+        log(f"replies: auto -> {mode} ({pending} reported)", a.quiet)
+    if mode != "none":
+        if mode == "all":
             todo = [c for c in comments if c["reply_total"] > 0]
         else:
             todo = [c for c in comments if c["reply_total"] >= a.reply_min]
@@ -380,7 +404,7 @@ def main():
         comments.sort(key=lambda c: c["time"])
 
     capped = bool(a.max) and len(comments) >= a.max
-    md = render(aweme_id, url, comments, claimed, stop, a.replies,
+    md = render(aweme_id, url, comments, claimed, stop, mode,
                 a.reply_min, reply_notes, a.sort, capped)
     with open(out, "w", encoding="utf-8") as f:
         f.write(md)
@@ -404,10 +428,14 @@ def main():
     got_r = sum(len(c["replies"]) for c in comments)
     print(f"{len(comments)} top-level + {got_r} replies -> {out}")
     if claimed and len(comments) < claimed and not capped:
+        gap = claimed - len(comments)
+        why = ("TikTok's pagination ceiling — not retrievable"
+               if len(comments) >= CEILING_HINT
+               else "normally deleted, hidden or filtered comments, not "
+                    "withholding")
         print(f"NOTE: TikTok claims {claimed} top-level comments and served "
-              f"{len(comments)}. The remaining {claimed - len(comments)} are "
-              "not retrievable — see the header in the output file.",
-              file=sys.stderr)
+              f"{len(comments)}. The {gap} not served are {why}. See the "
+              "header in the output file.", file=sys.stderr)
 
 
 if __name__ == "__main__":
