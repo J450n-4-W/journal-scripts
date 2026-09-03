@@ -38,7 +38,7 @@ EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 # parallel=0 that is one worker per core: 32 workers = ~45GB, which took a 92GB
 # machine into swap at 93% and load 40. Cap it, and size it against free memory
 # rather than core count.
-EMBED_WORKERS = 6
+EMBED_WORKERS = 16    # ceiling; the real number is min(this, memory, cores-6)
 SLICE = 5000          # commit progress every N chunks; bounds parent memory too
 EMBED_DIM = 384
 RRF_K = 60          # reciprocal-rank-fusion constant; ranks, not scores, so the
@@ -240,15 +240,25 @@ def load_vec(c):
         return False
 
 
-def embed_workers():
-    """Never more workers than memory allows. 1.4GB per worker, measured."""
+def embed_workers(override=None):
+    """Bounded by three things, whichever is smallest.
+
+    Memory: ~1.4GB per worker, measured — each loads its own copy of the model.
+    Use at most half of what is actually free so the machine stays usable.
+
+    Cores: leave 6 free. This is not about throughput, it is about latency —
+    saturating every core makes audio work impossible (xruns), and this box runs
+    Bitwig. A job that finishes an hour sooner but makes the machine unusable
+    while it runs is not faster in any sense that matters."""
+    if override:
+        return max(1, int(override))
     try:
         avail = int([l.split()[1] for l in open("/proc/meminfo")
                      if l.startswith("MemAvailable")][0]) * 1024
         by_mem = max(1, int(avail * 0.5 // (1.5 * 1024**3)))
     except Exception:
         by_mem = 2
-    return max(1, min(EMBED_WORKERS, by_mem, (os.cpu_count() or 4) - 2))
+    return max(1, min(EMBED_WORKERS, by_mem, (os.cpu_count() or 8) - 6))
 
 
 def embed_texts(texts, workers=None):
@@ -300,8 +310,9 @@ def _embed_run(args, struct):
     print(f"{len(todo)} chunks to embed (~{len(todo)/14.4/60:.0f} min at measured throughput)")
     # Frontmatter prepended: a chunk from mid-document otherwise carries no signal
     # about whose page it is.
-    w = embed_workers()
-    print(f"  {w} worker(s) (~{w * 1.4:.0f}GB); slices of {SLICE}", file=sys.stderr)
+    w = embed_workers(getattr(args, "workers", None))
+    print(f"  {w} worker(s) ≈ {w * 1.4:.0f}GB, leaving {(os.cpu_count() or 8) - w} cores free; "
+          f"slices of {SLICE}", file=sys.stderr)
     t0, done = time.time(), 0
     for lo in range(0, len(todo), SLICE):
         sl = todo[lo:lo + SLICE]
@@ -584,6 +595,7 @@ def main():
     l.set_defaults(fn=links_cmd)
     e = sub.add_parser("embed", help="compute missing chunk embeddings (resumable)")
     e.add_argument("--limit", type=int, default=0, help="stop after N chunks; resumable, so safe to run in slices")
+    e.add_argument("--workers", type=int, default=0, help="override worker count (default: sized against free memory and cores)")
     e.set_defaults(fn=embed_cmd)
     st = sub.add_parser("stat"); st.set_defaults(fn=stat_cmd)
     a = ap.parse_args(); return a.fn(a) or 0
