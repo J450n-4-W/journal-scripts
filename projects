@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""projects — persistent state for reporting projects, so work that has gone quiet can be
+surfaced. Absence generates no session log, so a log-derived brief cannot raise the thing
+you have stopped doing; this reads state that exists whether or not anything happened.
+
+Records are the existing `type: story` pages in ~/notebook/pages. Two field classes:
+hand-maintained (never written here) and derived (`last_activity`, `status` only).
+
+Spec and reasoning: ~/notebook/pages/projects.md
+
+Usage:
+    projects list       table of every record
+    projects check      gaps + stale statuses; writes nothing; exit 1 if action needed
+    projects refresh    recompute last_activity and status, write back
+    projects new NAME   create a page from templates/story.md with status: research
+"""
+import os, re, sys, pathlib, datetime, subprocess
+
+HOME = pathlib.Path.home()
+PAGES = HOME/"notebook/pages"
+LOGS = HOME/"notebook/ai-sessions"
+INVEST = (HOME/"Investigations").resolve()
+SPEC = PAGES/"projects.md"
+TEMPLATE = HOME/"notebook/templates/story.md"
+
+SHELVE_DAYS = 30
+SKIP_DIRNAMES = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+CONTAINERS = {"old_stories"}          # holds projects, is not one
+TODAY = datetime.date.today()
+
+
+# ── frontmatter ───────────────────────────────────────────────────────────────
+
+def split_fm(text):
+    m = re.match(r'^---\s*\n(.*?)\n---\s*\n?', text, re.S)
+    return (m.group(1), text[m.end():]) if m else (None, text)
+
+
+def scalar(fm, key):
+    m = re.search(rf'^{key}:[ \t]*(.*)$', fm, re.M)
+    if not m: return ""
+    return m.group(1).strip().strip('"\'')
+
+
+def yaml_list(fm, key):
+    m = re.search(rf'^{key}:[ \t]*(.*)$', fm, re.M)
+    if not m: return []
+    inline = m.group(1).strip()
+    if inline.startswith("["):
+        return [x.strip().strip('"\'') for x in inline.strip("[]").split(",") if x.strip()]
+    out = []
+    for line in fm[m.end():].splitlines():
+        if re.match(r'^\s*-\s+', line): out.append(re.sub(r'^\s*-\s+', '', line).strip().strip('"\''))
+        elif line.strip() and not line[:1].isspace(): break
+    return out
+
+
+def set_scalar(fm, key, value):
+    """Replace or append a single key. Never reserialises — everything else is untouched."""
+    if re.search(rf'^{key}:', fm, re.M):
+        return re.sub(rf'^{key}:.*$', f'{key}: {value}', fm, count=1, flags=re.M)
+    return fm.rstrip("\n") + f"\n{key}: {value}"
+
+
+def resolve(p):
+    """~ expansion + realpath. Story dirs move between the top level and old_stories/,
+    and paths were historically written against a ~/Guardian symlink."""
+    if not p: return None
+    p = p.strip().strip('"\'').rstrip("/")
+    try: return pathlib.Path(os.path.expanduser(p)).resolve()
+    except Exception: return None
+
+
+# ── the tool's own ignore list, read from its spec page ───────────────────────
+
+def ignored_dirs():
+    """One source of truth: the list lives in projects.md, not a dotfile."""
+    if not SPEC.is_file(): return set()
+    t = SPEC.read_text()
+    m = re.search(r'<!-- projects:ignore -->(.*?)<!-- /projects:ignore -->', t, re.S)
+    if not m: return set()
+    return {x.strip().strip('`') for x in re.findall(r'^\s*-\s+(.+)$', m.group(1), re.M)}
+
+
+# ── records ───────────────────────────────────────────────────────────────────
+
+class Record:
+    def __init__(self, path):
+        self.path = path
+        self.text = path.read_text()
+        self.fm, self.body = split_fm(self.text)
+        self.name = path.stem
+        self.status = scalar(self.fm, "status")
+        self.story_dir_raw = scalar(self.fm, "story_dir")
+        self.story_dir = resolve(self.story_dir_raw)
+        self.media_archive = resolve(scalar(self.fm, "media_archive"))
+        self.deadline = scalar(self.fm, "deadline")
+        # Matching logs on `tags:` would false-positive — a page tagged `far-right`
+        # would match every log tagged `far-right`. Use an explicit key instead.
+        # `project:` is the same key session logs use for the tag — same name, so the
+        # join is obvious. Falls back to the story_dir basename.
+        self.tag = scalar(self.fm, "project") or (
+            self.story_dir_raw.rstrip("/").split("/")[-1].lower() if self.story_dir_raw else "")
+
+    @property
+    def dir_exists(self):
+        return bool(self.story_dir and self.story_dir.is_dir())
+
+    def mtime_activity(self):
+        if not self.dir_exists: return None
+        newest = 0
+        for root, dirs, files in os.walk(self.story_dir):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRNAMES]
+            for f in files:
+                if f.endswith((".pyc", ".swp", "~")): continue
+                try: newest = max(newest, os.stat(os.path.join(root, f)).st_mtime)
+                except OSError: pass
+        return datetime.date.fromtimestamp(newest) if newest else None
+
+    def log_activity(self, log_index):
+        if not self.tag: return None
+        dates = log_index.get(self.tag.lower())
+        return max(dates) if dates else None
+
+    def outstanding(self):
+        """Bullets under '## Outstanding' plus the template's 'Contacted (no response)'."""
+        n = 0
+        for m in re.finditer(r'^##+\s*Outstanding\s*$(.*?)(?=^##\s|\Z)', self.body, re.S | re.M):
+            n += len(re.findall(r'^\s*[-*]\s+\S', m.group(1), re.M))
+        m = re.search(r'Contacted \(no response\)\**:?(.*?)(?=^##\s|\Z)', self.body, re.S | re.M)
+        if m: n += len(re.findall(r'^\s*[-*]\s+\S', m.group(1), re.M))
+        return n
+
+    def compute(self, log_index):
+        cands = [d for d in (self.mtime_activity(), self.log_activity(log_index)) if d]
+        self.last_activity = max(cands) if cands else None
+        self.days_quiet = (TODAY - self.last_activity).days if self.last_activity else None
+        # Published is terminal. Its working dir is deleted at closeout, so it would
+        # otherwise read as maximally quiet and win the abandoned slot forever.
+        if self.status == "published":
+            self.derived_status = "published"
+        elif self.days_quiet is None or self.days_quiet >= SHELVE_DAYS:
+            self.derived_status = "shelved"
+        else:
+            self.derived_status = "research"
+        return self
+
+    def write_back(self):
+        fm = set_scalar(self.fm, "last_activity",
+                        self.last_activity.isoformat() if self.last_activity else '""')
+        fm = set_scalar(fm, "status", self.derived_status)
+        new = f"---\n{fm}\n---\n{self.body}"
+        if new != self.text:
+            self.path.write_text(new); self.text = new; self.fm = fm
+            return True
+        return False
+
+
+def build_log_index():
+    """tag -> [dates]. Session logs carry `project: [a, b]`."""
+    idx = {}
+    for f in sorted(LOGS.glob("*.md")):
+        m = re.match(r'(\d{4}-\d{2}-\d{2})', f.name)
+        if not m: continue
+        d = datetime.date.fromisoformat(m.group(1))
+        fm, _ = split_fm(f.read_text(errors="ignore"))
+        if not fm: continue
+        for t in yaml_list(fm, "project"):
+            idx.setdefault(t.strip().lower(), []).append(d)
+    return idx
+
+
+def load_records():
+    out = []
+    for p in sorted(PAGES.glob("*.md")):
+        try: fm, _ = split_fm(p.read_text(errors="ignore"))
+        except Exception: continue
+        if fm and scalar(fm, "type") in ("story", "story-index"):
+            out.append(Record(p))
+    return out
+
+
+def find_gaps(records):
+    ignore = ignored_dirs()
+    claimed = {r.story_dir for r in records if r.story_dir}
+    dirs = []
+    for d in sorted(INVEST.iterdir()):
+        if not d.is_dir() or d.name in ignore: continue
+        if d.name in CONTAINERS:
+            dirs += [c for c in sorted(d.iterdir()) if c.is_dir() and c.name not in ignore]
+        else:
+            dirs.append(d)
+    unclaimed = [d for d in dirs if d.resolve() not in claimed]
+    # Rank by work sunk — the same signal brief slot 4 uses.
+    def weight(d):
+        n = 0
+        for root, dd, ff in os.walk(d):
+            dd[:] = [x for x in dd if x not in SKIP_DIRNAMES]; n += len(ff)
+        return n
+    return sorted(((d, weight(d)) for d in unclaimed), key=lambda x: -x[1])
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
+    if cmd not in {"list", "check", "refresh", "new"}:
+        print(f"projects: unknown command {cmd!r}", file=sys.stderr); return 2
+
+    if cmd == "new":
+        if len(sys.argv) < 3: print("projects new NAME", file=sys.stderr); return 2
+        name = sys.argv[2]
+        dest = PAGES/f"{name} (story).md"
+        if dest.exists(): print(f"exists: {dest}", file=sys.stderr); return 2
+        body = TEMPLATE.read_text() if TEMPLATE.is_file() else "---\ntype: story\n---\n"
+        body = body.replace("status: published", "status: research")
+        body = re.sub(r'<%.*?%>', "", body)
+        dest.write_text(body); print(f"created {dest}"); return 0
+
+    log_index = build_log_index()
+    records = [r.compute(log_index) for r in load_records()]
+
+    if cmd == "refresh":
+        n = sum(1 for r in records if r.write_back())
+        print(f"{len(records)} records, {n} updated")
+        return 0
+
+    if cmd == "list":
+        print(f"{'project':34} {'status':10} {'last activity':13} {'quiet':>6}  {'out':>3}  dir")
+        for r in sorted(records, key=lambda r: (r.days_quiet is None, -(r.days_quiet or 0))):
+            la = r.last_activity.isoformat() if r.last_activity else "—"
+            q = str(r.days_quiet) + "d" if r.days_quiet is not None else "—"
+            d = "ok" if r.dir_exists else ("archived" if r.derived_status == "published" else "MISSING")
+            print(f"{r.name[:34]:34} {r.derived_status:10} {la:13} {q:>6}  {r.outstanding():>3}  {d}")
+        return 0
+
+    # check — writes nothing
+    stale = [r for r in records if r.status != r.derived_status]
+    # Three distinct problems, not one: no story_dir ever recorded; a story_dir that
+    # points nowhere on an unpublished story; and a stale derived status.
+    unset = [r for r in records if not r.story_dir_raw]
+    missing = [r for r in records if r.story_dir_raw and not r.dir_exists
+               and r.derived_status != "published"]
+    gaps = find_gaps(records)
+    for r in stale:
+        was = r.status or "unset"
+        print(f"stale status: {r.name} is '{was}', should be '{r.derived_status}'")
+    for r in unset:
+        print(f"no story_dir: {r.name} — cannot track activity until one is set")
+    for r in missing:
+        print(f"missing dir: {r.name} -> {r.story_dir_raw} (not published, so not expected)")
+    if gaps:
+        print(f"unrecorded directories: {len(gaps)}")
+        for d, w in gaps[:3]:
+            print(f"  {d.relative_to(INVEST)} ({w} files)")
+        if len(gaps) > 3:
+            print(f"  … and {len(gaps)-3} more — `projects check --all` to list")
+    if "--all" in sys.argv:
+        for d, w in gaps[3:]:
+            print(f"  {d.relative_to(INVEST)} ({w} files)")
+    if not (stale or unset or missing or gaps):
+        print("projects: clean")
+    return 1 if (stale or unset or missing or gaps) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
