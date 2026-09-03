@@ -316,6 +316,7 @@ fi
 # LARGE MEDIA → Reporting_Media_Archive (MOVED)
 # ============================================================
 
+MEDIA_MOVED=0
 media_files="$(find "$STORY_DIR" \( \
     -name '*.webm' -o -name '*.mkv' -o -name '*.mp4' \
     -o -name '*.mp3' -o -name '*.m4a' \
@@ -337,6 +338,7 @@ if [[ -n "$media_files" ]]; then
             fi
         done <<< "$media_files"
         echo "Media: moved $moved_media file(s) → $MEDIA_DEST/"
+        MEDIA_MOVED=1
     fi
 else
     echo "Media: none found"
@@ -395,6 +397,69 @@ if [[ ${#skipped_txt[@]} -gt 0 ]]; then
     echo ""
 fi
 
+# --- story page: mark published, record where the media went ---
+# Matched on resolved story_dir, never on page title: frontmatter slugs and on-disk
+# directory names diverge freely (Jace_Yarbrough vs yarbrough, aief-trips vs
+# Israel_Trips). Only `status` and `media_archive` are written; `projects` owns
+# `last_activity`, everything else is hand-maintained.
+STORY_PAGE="$(STORY_DIR="$STORY_DIR" VAULT="$VAULT" python3 - <<'PYFIND'
+import os, re, pathlib
+target = pathlib.Path(os.environ["STORY_DIR"]).resolve()
+for f in sorted((pathlib.Path(os.environ["VAULT"])/"pages").glob("*.md")):
+    try: t = f.read_text(errors="ignore")
+    except Exception: continue
+    m = re.match(r'^---\s*\n(.*?)\n---', t, re.S)
+    if not m: continue
+    d = re.search(r'^story_dir:[ \t]*(.*)$', m.group(1), re.M)
+    if not d: continue
+    v = d.group(1).strip().strip('"\'').rstrip("/")
+    if not v: continue
+    try:
+        if pathlib.Path(os.path.expanduser(v)).resolve() == target:
+            print(f); break
+    except Exception: pass
+PYFIND
+)"
+
+if [[ -n "$STORY_PAGE" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+        if [[ "$MEDIA_MOVED" == "1" ]]; then
+            echo "Story page: would set status: published and media_archive in $(basename "$STORY_PAGE")"
+        else
+            echo "Story page: would set status: published in $(basename "$STORY_PAGE") (no media moved)"
+        fi
+    else
+        STORY_PAGE="$STORY_PAGE" MEDIA_DEST="$MEDIA_DEST" MEDIA_MOVED="$MEDIA_MOVED" python3 - <<'PYSET'
+import os, re, pathlib
+p = pathlib.Path(os.environ["STORY_PAGE"])
+t = p.read_text()
+m = re.match(r'^---\s*\n(.*?)\n---\s*\n?', t, re.S)
+if m:
+    fm, body = m.group(1), t[m.end():]
+    def setk(fm, k, v):
+        if re.search(rf'^{k}:', fm, re.M):
+            return re.sub(rf'^{k}:.*$', f'{k}: {v}', fm, count=1, flags=re.M)
+        return fm.rstrip("\n") + f"\n{k}: {v}"
+    fm = setk(fm, "status", "published")
+    if os.environ.get("MEDIA_MOVED") == "1":
+        fm = setk(fm, "media_archive", f'"{os.environ["MEDIA_DEST"]}"')
+    new = f"---\n{fm}\n---\n{body}"
+    if new != t:
+        p.write_text(new)
+        print(f"Story page: {p.name} → status: published" +
+              (", media_archive recorded" if os.environ.get("MEDIA_MOVED") == "1" else ""))
+    else:
+        print(f"Story page: {p.name} already current")
+PYSET
+    fi
+else
+    echo "Story page: none found with story_dir → $STORY_DIR"
+    echo "  Create ~/notebook/pages/${SLUG} (story).md with:"
+    echo "    type: story, status: published, story_dir: \"$STORY_DIR\""
+    [[ "$MEDIA_MOVED" == "1" ]] && echo "    media_archive: \"$MEDIA_DEST\""
+fi
+echo ""
+
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "*** DRY RUN — nothing was changed. Re-run without --dry-run to apply. ***"
     exit 0
@@ -403,8 +468,8 @@ fi
 echo "Next steps (use Claude):"
 echo "  1. Add frontmatter + wikilinks to text files in $ARCHIVE"
 echo "     (tag each with story: \"[[${SLUG} (story)]]\")"
-echo "  2. Create story index page: ~/notebook/pages/${SLUG} (story).md"
+echo "  2. Story index page: ~/notebook/pages/${SLUG} (story).md"
+echo "     — status and media_archive are set above if the page already existed"
 echo "     — link assets from $ASSETS/$SLUG/ at bottom of page"
-echo "     — note media archive location: $MEDIA_DEST/"
 echo "  3. Create/update entity pages for people, orgs, events, places"
 echo "  4. Fold working notes into entity pages as subheadings"
