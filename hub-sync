@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""hub-sync — keep the vault's tool and skill indexes honest by listing what exists on
+disk but is named nowhere on the hub page.
+
+Two targets:
+  ~/.local/bin/*            (executables)  -> ~/notebook/pages/CLI Tools.md
+  ~/.claude/skills/*/       (SKILL.md)     -> ~/notebook/pages/Claude Skills.md
+
+Design note: there is deliberately NO attempt to classify "Jason's script" vs
+"third-party binary". The hub page already lists off-the-shelf tools in their own
+section, so the page IS the filter — anything named anywhere on it is filed, whatever
+its provenance. A tool surfaces once, gets filed by hand into the right section, and
+never appears again. That keeps one source of truth instead of a second exclusion list
+that would rot.
+
+Everything outside the <!-- hub-sync:begin --> / <!-- hub-sync:end --> markers is left
+byte-identical. The markers are appended to the page if absent.
+
+Usage:
+    hub-sync              rewrite the generated block in both pages
+    hub-sync --check      report counts and any skill-frontmatter defects, write
+                          nothing, exit 1 if anything is unfiled or defective
+    hub-sync --dry-run    print the block that would be written, write nothing
+"""
+import os, re, sys, pathlib
+
+HOME = pathlib.Path.home()
+BEGIN, END = "<!-- hub-sync:begin -->", "<!-- hub-sync:end -->"
+
+TARGETS = [
+    ("tools",  HOME/".local/bin",      HOME/"notebook/pages/CLI Tools.md"),
+    ("skills", HOME/".claude/skills",  HOME/"notebook/pages/Claude Skills.md"),
+]
+
+
+def desc_from_script(p):
+    """Jason's scripts carry '<basename> — <description>' in their first few lines,
+    as a # comment or inside a docstring. Absent is fine — the row prompts for one."""
+    try:
+        head = p.read_text(errors="ignore").splitlines()[:6]
+    except Exception:
+        return ""
+    for line in head[1:]:
+        m = re.search(rf'{re.escape(p.name)}\s*[—–-]\s*(.+)', line)
+        if m:
+            return m.group(1).strip().strip('"').rstrip('.')
+    return ""
+
+
+def desc_from_skill(p):
+    """First sentence of the SKILL.md frontmatter description. Skill descriptions carry
+    long trigger lists that are useful to the agent and unreadable in a table."""
+    try:
+        text = p.read_text(errors="ignore")
+    except Exception:
+        return ""
+    m = re.search(r'^---\s*$(.*?)^---\s*$', text, re.S | re.M)
+    if not m:
+        return ""
+    fm = m.group(1)
+    d = re.search(r'^description:[ \t]*(.*)$', fm, re.M)
+    if not d:
+        return ""
+    s = d.group(1).strip().strip('"\'')
+    # YAML folded/literal scalar: the value is the indented block that follows.
+    if s in ("", ">", "|") or re.fullmatch(r'[>|][-+]?\d*', s):
+        tail = fm[d.end():].splitlines()
+        parts = []
+        for line in tail[1:] if tail and not tail[0].strip() else tail:
+            if line.strip() and not line[:1].isspace():
+                break
+            if line.strip():
+                parts.append(line.strip())
+        s = " ".join(parts)
+    return re.split(r'(?<=[.!?])\s', s)[0].rstrip('.') if s else ""
+
+
+def frontmatter_defects(root):
+    """Skills are surfaced to the model by their frontmatter, so a missing or wrong
+    'description' makes a skill effectively unreachable — it will never be matched
+    against a request. That failure is silent: the skill still exists, still works when
+    invoked by name, and never gets invoked. Found in the wild on `fara`, whose SKILL.md
+    had no frontmatter at all and was being advertised as
+    'Base directory for this skill: /home/jason/.claude/skills/fara'.
+
+    Returns [(skill_name, problem)]."""
+    out = []
+    if not root.is_dir():
+        return out
+    for d in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+        f = d/"SKILL.md"
+        if not (d.is_dir() and f.is_file()):
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except Exception:
+            out.append((d.name, "unreadable")); continue
+        m = re.match(r'^---\s*\n(.*?)\n---\s*$', text, re.S | re.M)
+        if not m:
+            out.append((d.name, "no YAML frontmatter — skill is invisible to model invocation"))
+            continue
+        fm = m.group(1)
+        name = re.search(r'^name:\s*(\S+)', fm, re.M)
+        if not name:
+            out.append((d.name, "frontmatter has no 'name'"))
+        elif name.group(1).strip('"\'') != d.name:
+            out.append((d.name, f"name is '{name.group(1)}' but directory is '{d.name}'"))
+        if not desc_from_skill(f):
+            out.append((d.name, "frontmatter has no usable 'description'"))
+    return out
+
+
+def scan(kind, root):
+    """Return [(name, description)] of everything present on disk."""
+    found = []
+    if not root.is_dir():
+        return found
+    for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+        if kind == "tools":
+            if not p.is_file() or not os.access(p, os.X_OK):
+                continue
+            if ".bak" in p.name or p.name.startswith("__"):
+                continue
+            found.append((p.name, desc_from_script(p)))
+        else:
+            skill = p/"SKILL.md"
+            if p.is_dir() and skill.is_file():
+                found.append((p.name, desc_from_skill(skill)))
+    return found
+
+
+def split_page(text):
+    """(before, after) with the generated block removed. The block MUST be excluded
+    before testing whether a name is filed, or a name listed as unfiled would count as
+    'named on the page' and never clear."""
+    i, j = text.find(BEGIN), text.find(END)
+    if i == -1 or j == -1 or j < i:
+        return text.rstrip("\n") + "\n", ""
+    return text[:i], text[j + len(END):]
+
+
+def render(kind, unfiled):
+    label = "tool" if kind == "tools" else "skill"
+    out = [BEGIN, "", "## Unfiled", ""]
+    if not unfiled:
+        out += [f"_Nothing unfiled. Generated by `hub-sync`._", ""]
+    else:
+        out += [f"_Generated by `hub-sync`. Move each row into the appropriate section "
+                f"above and write its one-liner; it disappears from here on the next run._", "",
+                f"| {label.capitalize()} | Detected one-liner |", "|---|---|"]
+        for name, d in unfiled:
+            out.append(f"| `{name}` | {d or '—'} |")
+        out.append("")
+    out.append(END)
+    return "\n".join(out)
+
+
+def main():
+    mode = "write"
+    for a in sys.argv[1:]:
+        if a == "--check":
+            mode = "check"
+        elif a == "--dry-run":
+            mode = "dry"
+        else:
+            print(f"hub-sync: unknown argument {a!r}", file=sys.stderr)
+            return 2
+
+    defects = frontmatter_defects(HOME/".claude/skills")
+    if defects:
+        print(f"skill frontmatter: {len(defects)} defect(s)")
+        for n, why in defects:
+            print(f"  {n}: {why}")
+    elif mode == "check":
+        print("skill frontmatter: clean")
+
+    total_unfiled = 0
+    for kind, root, page in TARGETS:
+        if not page.is_file():
+            print(f"hub-sync: page missing, skipped: {page}", file=sys.stderr)
+            continue
+        text = page.read_text()
+        before, after = split_page(text)
+        known = before + after
+        unfiled = [(n, d) for n, d in scan(kind, root) if n not in known]
+        total_unfiled += len(unfiled)
+
+        if mode == "check":
+            print(f"{kind}: {len(unfiled)} unfiled" +
+                  (f" ({', '.join(n for n, _ in unfiled)})" if unfiled else ""))
+            continue
+
+        block = render(kind, unfiled)
+        new = before.rstrip("\n") + "\n\n" + block + "\n" + (after.lstrip("\n") and "\n" + after.lstrip("\n") or "")
+        if mode == "dry":
+            print(f"--- {page} ---"); print(block); print()
+            continue
+        if new != text:
+            page.write_text(new)
+            print(f"{kind}: {len(unfiled)} unfiled, wrote {page.name}")
+        else:
+            print(f"{kind}: {len(unfiled)} unfiled, no change")
+
+    return 1 if (mode == "check" and (total_unfiled or defects)) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
