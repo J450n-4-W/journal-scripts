@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""brief — six-slot morning brief appended to the daily note at 06:00.
+
+The binding constraint is being read, not being complete: daily-session-log wrote
+handoff-quality logs for months that went unread. So slots are capped at one line,
+empty slots yield rather than pad, and items that keep surfacing without being acted
+on age out and get reported.
+
+Spec and reasoning: ~/notebook/pages/brief.md
+
+Usage:
+    brief                write the block into today's daily note
+    brief --dry-run      print the block, write nothing
+    brief --show         print slots without touching state
+    brief dismiss KEY    silence an item for the cooldown period
+    brief --rollup       weekly aged-out report
+"""
+import os, re, sys, json, pathlib, datetime, subprocess
+
+HOME = pathlib.Path.home()
+JOURNALS = HOME/"notebook/journals"
+STAGING = HOME/"notebook-staging"
+LIFE = HOME/"notebook/life"
+STATE = HOME/".local/state/brief-state.json"
+INVEST = (HOME/"Investigations").resolve()
+
+# Provisional — guessed, not derived. Replace by observing real data.
+SLIPPING_DAYS = 10
+COOLDOWN_DAYS = 21
+AGE_OUT_AFTER = 5
+
+BEGIN, END = "<!-- brief:begin -->", "<!-- brief:end -->"
+TODAY = datetime.date.today()
+
+
+def load_state():
+    if STATE.is_file():
+        try: return json.loads(STATE.read_text())
+        except Exception: pass
+    return {"surfaced": {}, "dismissed": {}, "aged_out": []}
+
+
+def save_state(s):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(s, indent=1, sort_keys=True))
+
+
+def projects_records():
+    """Reuse the projects tool rather than reimplementing its status logic."""
+    src = HOME/"Software_Development_Projects/journal-scripts/projects"
+    if not src.is_file(): return [], []
+    import importlib.util, importlib.machinery
+    l = importlib.machinery.SourceFileLoader("pj", str(src))
+    pj = importlib.util.module_from_spec(importlib.util.spec_from_loader("pj", l))
+    l.exec_module(pj)
+    idx = pj.build_log_index()
+    recs = [r.compute(idx) for r in pj.load_records()]
+    return recs, pj.find_gaps(recs)
+
+
+def sh(cmd):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return p.stdout.strip(), p.returncode
+    except Exception:
+        return "", 0
+
+
+def candidates():
+    """[(slot, key, line)] — at most one per slot, already filtered and ranked."""
+    out = []
+    recs, gaps = projects_records()
+    live = [r for r in recs if r.derived_status == "research" and r.last_activity]
+    live.sort(key=lambda r: r.last_activity, reverse=True)
+
+    for r in live[:2]:
+        n = r.outstanding()
+        out.append(("open", f"project:{r.name}",
+                    f"**{r.name}** — active, {r.days_quiet}d since last activity"
+                    + (f", {n} outstanding" if n else "")))
+
+    slipping = [r for r in recs
+                if r.derived_status != "published" and r.outstanding() > 0
+                and (r.days_quiet or 0) >= SLIPPING_DAYS]
+    slipping.sort(key=lambda r: r.days_quiet or 0, reverse=True)
+    if slipping:
+        r = slipping[0]
+        out.append(("slipping", f"slip:{r.name}",
+                    f"**{r.name}** slipping — quiet {r.days_quiet}d with {r.outstanding()} outstanding"))
+
+    aband = [(f"gap:{d.name}", f"**{d.relative_to(INVEST)}** — {w} files, no story page", w)
+             for d, w in gaps]
+    aband += [(f"shelved:{r.name}", f"**{r.name}** — shelved, quiet {r.days_quiet}d", 0)
+              for r in recs if r.derived_status == "shelved"]
+    aband.sort(key=lambda x: -x[2])
+    if aband:
+        out.append(("abandoned", aband[0][0], aband[0][1]))
+
+    maint = []
+    hs, rc = sh(["hub-sync", "--check"])
+    if rc == 1:
+        first = [l for l in hs.splitlines() if not l.endswith("0 unfiled") and "clean" not in l]
+        if first: maint.append(first[0].strip())
+    pc, rc = sh(["projects", "check"])
+    if rc == 1:
+        stale = [l for l in pc.splitlines() if l.startswith(("stale status", "no story_dir"))]
+        if stale: maint.append(f"{len(stale)} project record(s) need attention")
+    patches = len(list((STAGING/"digest/patches").glob("*"))) if (STAGING/"digest/patches").is_dir() else 0
+    if patches: maint.append(f"{patches} staged vault-digest patch(es) awaiting review")
+    stubs = len(list((STAGING/"stubs").glob("*.md"))) if (STAGING/"stubs").is_dir() else 0
+    if stubs: maint.append(f"{stubs} drafted stub(s) awaiting review")
+    if maint:
+        out.append(("maintenance", "maint:" + maint[0][:40], "; ".join(maint[:2])))
+
+    if LIFE.is_dir():
+        items = sorted(LIFE.glob("*.md"))
+        if items:
+            oldest = min(items, key=lambda p: p.stat().st_mtime)
+            out.append(("life", f"life:{oldest.stem}", f"**{oldest.stem}**"))
+    return out
+
+
+def render(state, record=True, cands=None):
+    cands = candidates() if cands is None else cands
+    lines, surfaced = [], []
+    for slot, key, text in cands:
+        d = state["dismissed"].get(key)
+        if d and datetime.date.fromisoformat(d) > TODAY:
+            continue
+        seen = state["surfaced"].get(key, {"count": 0})
+        if seen["count"] >= AGE_OUT_AFTER:
+            continue                      # aged out; already reported in a rollup
+        lines.append(f"- {text}")
+        surfaced.append(key)
+    if record:
+        for key in surfaced:
+            e = state["surfaced"].setdefault(key, {"count": 0, "first": TODAY.isoformat()})
+            # Count mornings surfaced, not times run. Re-running by hand must not
+            # age an item out early.
+            if e.get("last") == TODAY.isoformat():
+                continue
+            e["count"] += 1
+            e["last"] = TODAY.isoformat()
+            if e["count"] == AGE_OUT_AFTER:
+                state["aged_out"].append({"key": key, "on": TODAY.isoformat()})
+        # An item that stopped being a candidate has cleared — forget it, so a
+        # recurrence starts a fresh count rather than ageing out immediately.
+        live = {k for _, k, _ in cands}
+        for k in list(state["surfaced"]):
+            if k not in live and state["surfaced"][k]["count"] < AGE_OUT_AFTER:
+                del state["surfaced"][k]
+    return lines, surfaced
+
+
+def block(lines):
+    body = "\n".join(lines) if lines else "_Nothing to raise._"
+    if TODAY.weekday() == 0:
+        st = load_state()
+        recent = [a for a in st.get("aged_out", [])
+                  if (TODAY - datetime.date.fromisoformat(a["on"])).days <= 7]
+        if recent:
+            body += f"\n- _{len(recent)} item(s) aged out unactioned this week: " \
+                    + ", ".join(a["key"] for a in recent) + "_"
+    return f"{BEGIN}\n\n## Morning brief\n\n{body}\n\n{END}"
+
+
+def write_note(text):
+    JOURNALS.mkdir(parents=True, exist_ok=True)
+    note = JOURNALS/f"{TODAY.strftime('%Y_%m_%d')}.md"
+    cur = note.read_text() if note.is_file() else ""
+    i, j = cur.find(BEGIN), cur.find(END)
+    if i != -1 and j != -1:
+        new = cur[:i] + text + cur[j+len(END):]
+    else:
+        new = (cur.rstrip("\n") + "\n\n" if cur.strip() else "") + text + "\n"
+    if new != cur:
+        note.write_text(new); return note, True
+    return note, False
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "dismiss":
+        if len(args) < 2: print("brief dismiss KEY", file=sys.stderr); return 2
+        s = load_state()
+        s["dismissed"][args[1]] = (TODAY + datetime.timedelta(days=COOLDOWN_DAYS)).isoformat()
+        save_state(s); print(f"dismissed {args[1]} until {s['dismissed'][args[1]]}"); return 0
+    if "--rollup" in args:
+        s = load_state()
+        if not s.get("aged_out"): print("nothing has aged out"); return 0
+        for a in s["aged_out"][-20:]: print(f"{a['on']}  {a['key']}")
+        return 0
+    if "--show" in args or "--dry-run" in args:
+        lines, _ = render(load_state(), record=False)
+        print(block(lines)); return 0
+    s = load_state()
+    lines, surfaced = render(s, record=True)
+    note, changed = write_note(block(lines))
+    save_state(s)
+    print(f"{len(lines)} slot(s) filled, {'wrote' if changed else 'no change to'} {note.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
