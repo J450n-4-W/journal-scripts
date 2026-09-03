@@ -182,7 +182,14 @@ def main():
         text = page.read_text()
         before, after = split_page(text)
         known = before + after
-        unfiled = [(n, d) for n, d in scan(kind, root) if n not in known]
+        # A bare substring match answers a different question than "is there a row
+        # for this tool": a tool named `brief` would count as filed because the page
+        # says "morning brief". Require the name backticked, which is how generated
+        # and hand-written rows both render it. (Measured 2026-09-03: the two tests
+        # agreed on all 63 tools, so this is latent rather than live — but it is the
+        # kind of proxy that only fails once a tool is named after a common word.)
+        filed = lambda n: re.search(rf'`{re.escape(n)}`', known) is not None
+        unfiled = [(n, d) for n, d in scan(kind, root) if not filed(n)]
         total_unfiled += len(unfiled)
 
         if mode == "check":

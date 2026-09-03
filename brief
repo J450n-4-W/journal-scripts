@@ -22,6 +22,7 @@ JOURNALS = HOME/"notebook/journals"
 STAGING = HOME/"notebook-staging"
 LIFE = HOME/"notebook/life"
 STATE = HOME/".local/state/brief-state.json"
+LOGFILE = HOME/".local/state/brief.log"
 INVEST = (HOME/"Investigations").resolve()
 
 # Provisional — guessed, not derived. Replace by observing real data.
@@ -31,6 +32,12 @@ AGE_OUT_AFTER = 5
 
 BEGIN, END = "<!-- brief:begin -->", "<!-- brief:end -->"
 TODAY = datetime.date.today()
+
+
+def log(msg):
+    LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOGFILE, "a") as f:
+        f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
 
 
 def load_state():
@@ -47,8 +54,15 @@ def save_state(s):
 
 def projects_records():
     """Reuse the projects tool rather than reimplementing its status logic."""
-    src = HOME/"Software_Development_Projects/journal-scripts/projects"
-    if not src.is_file(): return [], []
+    # Resolve the SAME binary the maintenance slot shells out to. Importing from a
+    # hard-coded dev path while also invoking `projects` from $PATH gave two copies
+    # that could silently diverge if one was edited without installing.
+    import shutil
+    found = shutil.which("projects")
+    src = pathlib.Path(found).resolve() if found else HOME/"Software_Development_Projects/journal-scripts/projects"
+    if not src.is_file():
+        log("projects binary not found; slots 1-4 unavailable")
+        return [], []
     import importlib.util, importlib.machinery
     l = importlib.machinery.SourceFileLoader("pj", str(src))
     pj = importlib.util.module_from_spec(importlib.util.spec_from_loader("pj", l))
@@ -59,20 +73,38 @@ def projects_records():
 
 
 def sh(cmd):
+    """Returns (stdout, returncode). A missing binary, a crash or a timeout returns
+    rc=-1 — NOT rc=0 with empty output, which is what "the command ran and found
+    nothing" looks like. Conflating those is how a broken maintenance check reads as
+    a clean one, which is the failure this whole tool exists to surface elsewhere."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return p.stdout.strip(), p.returncode
-    except Exception:
-        return "", 0
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return r.stdout.strip(), r.returncode
+    except Exception as e:
+        log(f"subprocess failed: {' '.join(cmd)}: {type(e).__name__}: {e}")
+        return "", -1
 
 
-def candidates():
-    """[(slot, key, line)] — at most one per slot, already filtered and ranked."""
+def candidates(state=None):
+    """[(slot, key, line)] — at most one per slot, already filtered and ranked.
+
+    `state` filters dismissed and aged-out items BEFORE each slot picks its top
+    candidate. Picking first and filtering afterwards left the slot empty for good
+    once its leader aged out: the second-slipping project was never reachable."""
+    state = state or {"dismissed": {}, "surfaced": {}}
+
+    def alive(key):
+        d = state.get("dismissed", {}).get(key)
+        if d and datetime.date.fromisoformat(d) > TODAY:
+            return False
+        return state.get("surfaced", {}).get(key, {}).get("count", 0) < AGE_OUT_AFTER
+
     out = []
     recs, gaps = projects_records()
     live = [r for r in recs if r.derived_status == "research" and r.last_activity]
     live.sort(key=lambda r: r.last_activity, reverse=True)
 
+    live = [r for r in live if alive(f"project:{r.name}")]
     for r in live[:2]:
         n = r.outstanding()
         out.append(("open", f"project:{r.name}",
@@ -82,6 +114,7 @@ def candidates():
     slipping = [r for r in recs
                 if r.derived_status != "published" and r.outstanding() > 0
                 and (r.days_quiet or 0) >= SLIPPING_DAYS]
+    slipping = [r for r in slipping if alive(f"slip:{r.name}")]
     slipping.sort(key=lambda r: r.days_quiet or 0, reverse=True)
     if slipping:
         r = slipping[0]
@@ -92,16 +125,19 @@ def candidates():
              for d, w in gaps]
     aband += [(f"shelved:{r.name}", f"**{r.name}** — shelved, quiet {r.days_quiet}d", 0)
               for r in recs if r.derived_status == "shelved"]
+    aband = [a for a in aband if alive(a[0])]
     aband.sort(key=lambda x: -x[2])
     if aband:
         out.append(("abandoned", aband[0][0], aband[0][1]))
 
-    maint = []
+    maint, broken = [], []
     hs, rc = sh(["hub-sync", "--check"])
+    if rc == -1: broken.append("hub-sync")
     if rc == 1:
         first = [l for l in hs.splitlines() if not l.endswith("0 unfiled") and "clean" not in l]
         if first: maint.append(first[0].strip())
     pc, rc = sh(["projects", "check"])
+    if rc == -1: broken.append("projects")
     if rc == 1:
         stale = [l for l in pc.splitlines() if l.startswith(("stale status", "no story_dir"))]
         if stale: maint.append(f"{len(stale)} project record(s) need attention")
@@ -109,11 +145,19 @@ def candidates():
     if patches: maint.append(f"{patches} staged vault-digest patch(es) awaiting review")
     stubs = len(list((STAGING/"stubs").glob("*.md"))) if (STAGING/"stubs").is_dir() else 0
     if stubs: maint.append(f"{stubs} drafted stub(s) awaiting review")
-    if maint:
-        out.append(("maintenance", "maint:" + maint[0][:40], "; ".join(maint[:2])))
+    if broken:
+        # Stable key: keyed on which check broke, not on its (changing) message text.
+        out.append(("maintenance", "maint:broken:" + ",".join(sorted(broken)),
+                    f"⚠ maintenance check failed to run: {', '.join(broken)} — see ~/.local/state/brief.log"))
+    elif maint:
+        # Key on the KIND of item, not the text: "3 staged patches" -> "4 staged
+        # patches" used to change the key, reset the surfaced count, and prevent
+        # the item ever ageing out.
+        kind = re.sub(r'\d+', 'N', maint[0])[:60]
+        out.append(("maintenance", "maint:" + kind, "; ".join(maint[:2])))
 
     if LIFE.is_dir():
-        items = sorted(LIFE.glob("*.md"))
+        items = [f for f in sorted(LIFE.glob("*.md")) if alive(f"life:{f.stem}")]
         if items:
             oldest = min(items, key=lambda p: p.stat().st_mtime)
             out.append(("life", f"life:{oldest.stem}", f"**{oldest.stem}**"))
@@ -145,11 +189,61 @@ def render(state, record=True, cands=None):
                 state["aged_out"].append({"key": key, "on": TODAY.isoformat()})
         # An item that stopped being a candidate has cleared — forget it, so a
         # recurrence starts a fresh count rather than ageing out immediately.
-        live = {k for _, k, _ in cands}
+        live = {k for _, k, _ in candidates()}   # unfiltered: what is *actually* a
+                                                 # candidate, not what survived state
+        # Clear ANY item that has left the candidate set, aged-out included. Keeping
+        # aged-out entries forever meant a condition that recurred months later was
+        # silently suppressed, despite the comment claiming a fresh count.
         for k in list(state["surfaced"]):
-            if k not in live and state["surfaced"][k]["count"] < AGE_OUT_AFTER:
+            if k not in live:
                 del state["surfaced"][k]
     return lines, surfaced
+
+
+# (label, newest-mtime source, expected cadence in hours). A job whose artefact is
+# older than 2x its cadence is stale; one with no artefact at all has never run.
+HEALTH = [
+    ("session-log",  HOME/".local/state/daily-session-log.log",        24),
+    ("brief",        HOME/".local/state/brief.log",                    24),
+    ("index",        HOME/".local/state/vault-search.db",              24 * 7),
+    ("ct-watch",     HOME/"Investigations/old_stories/NDA/evidence/crtsh/watch", 12),
+    ("fara-watch",   HOME/"notebook/fara-watch",                       24),
+    ("congress-watch", HOME/"notebook/congress-watch",                 24),
+    ("donor-watch",  HOME/"notebook/donor-watch",                      24 * 7),
+    ("gift-travel",  HOME/"notebook/gift-travel-watch",                24 * 7),
+    ("backup",       pathlib.Path("/mnt/4tb-external/home-backup/snapshots"), 24 * 8),
+]
+
+
+def health_line():
+    """The ten-week dead cron job, the unread session logs and a maintenance check
+    that failed silently are the same failure: automation that stops without saying
+    so. This puts every job's liveness into the one artefact that gets read daily."""
+    import time
+    now, parts, stale = time.time(), [], False
+    for label, path, cadence in HEALTH:
+        try:
+            if path.is_dir():
+                ts = max((f.stat().st_mtime for f in path.iterdir()), default=0)
+            else:
+                ts = path.stat().st_mtime
+        except Exception:
+            ts = 0
+        if not ts:
+            # An external drive that is simply unplugged is not a dead job. Saying
+            # so avoids a standing false alarm, which is how a health line gets
+            # ignored — the exact failure it exists to prevent.
+            if not path.parent.exists():
+                parts.append(f"{label} n/a"); continue
+            parts.append(f"{label} never"); stale = True; continue
+        age_h = (now - ts) / 3600
+        if age_h > cadence * 2:
+            parts.append(f"**{label} {int(age_h // 24)}d**" if age_h >= 24 else f"**{label} {int(age_h)}h**")
+            stale = True
+        else:
+            parts.append(f"{label} {int(age_h // 24)}d" if age_h >= 24 else f"{label} {int(age_h)}h")
+    mark = "⚠ " if stale else ""
+    return f"_{mark}health: " + " · ".join(parts) + "_"
 
 
 def block(lines):
@@ -161,7 +255,7 @@ def block(lines):
         if recent:
             body += f"\n- _{len(recent)} item(s) aged out unactioned this week: " \
                     + ", ".join(a["key"] for a in recent) + "_"
-    return f"{BEGIN}\n\n## Morning brief\n\n{body}\n\n{END}"
+    return f"{BEGIN}\n\n## Morning brief\n\n{body}\n\n{health_line()}\n\n{END}"
 
 
 def write_note(text):

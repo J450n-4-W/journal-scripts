@@ -31,6 +31,7 @@ MANIFEST = HOME/".config/vault-search/manifest.toml"
 DB = HOME/".local/state/vault-search.db"      # outside the vault: a vector store inside
                                               # a repo with hourly autocommit is a disaster
 TARGET_CHARS = 2000
+MAX_CHARS = 6000      # hard ceiling: a file with no blank lines must still split
 MIN_CHUNK = 200
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
@@ -123,30 +124,70 @@ def parse_frontmatter(fm):
 
 
 def chunk(text, offset=0):
-    """Markdown-aware: split on headings, then pack paragraphs to TARGET_CHARS.
+    """Markdown-aware: split on headings, pack to TARGET_CHARS, break at a blank line
+    where one exists and at MAX_CHARS where one does not.
+
+    Three failure modes this guards against, all found in the first real index:
+      - A file with no blank lines used to become ONE chunk of the whole file. The
+        worst case in the live corpus was 6,041,077 characters. bge-small truncates
+        at 512 tokens, so ~99.9% of that document was semantically invisible.
+      - A trailing fragment under MIN_CHUNK was dropped, losing the tail of every
+        section that did not divide evenly.
+      - A document shorter than MIN_CHUNK produced NO chunks at all: it existed in
+        `documents`, was counted in `stat`, and could never be found. 698 documents
+        were in that state.
+
     Yields (heading, text, start_line, end_line)."""
     lines = text.splitlines()
     sections, cur, head, start = [], [], "", 0
     for i, ln in enumerate(lines):
         if re.match(r'^#{1,6}\s+\S', ln):
-            if cur: sections.append((head, cur, start))
+            if cur or head: sections.append((head, cur, start))
             head, cur, start = ln.lstrip("#").strip(), [], i
         else:
             cur.append(ln)
-    if cur: sections.append((head, cur, start))
+    if cur or head: sections.append((head, cur, start))
 
+    out = []
     for head, body, start in sections:
         buf, buf_start = [], start
         for i, ln in enumerate(body):
-            buf.append(ln)
-            if sum(len(x) for x in buf) >= TARGET_CHARS and not ln.strip():
+            if buf and sum(len(x) + 1 for x in buf) + len(ln) > MAX_CHARS:
                 t = "\n".join(buf).strip()
-                if len(t) >= MIN_CHUNK:
-                    yield head, t, offset + buf_start + 1, offset + start + i + 1
+                if t: out.append([head, t, offset + buf_start + 1, offset + start + i + 1])
+                buf, buf_start = [], start + i
+            buf.append(ln)
+            size = sum(len(x) + 1 for x in buf)
+            # Break at a blank line once big enough, OR force a break at the hard
+            # ceiling so a file without blank lines cannot produce one vast chunk.
+            if (size >= TARGET_CHARS and not ln.strip()) or size >= MAX_CHARS:
+                t = "\n".join(buf).strip()
+                if t: out.append([head, t, offset + buf_start + 1, offset + start + i + 1])
                 buf, buf_start = [], start + i
         t = "\n".join(buf).strip()
-        if len(t) >= MIN_CHUNK:
-            yield head, t, offset + buf_start + 1, offset + start + len(body) + 1
+        if t: out.append([head, t, offset + buf_start + 1, offset + start + len(body) + 1])
+
+    # Merge a short tail into its predecessor rather than dropping it.
+    merged = []
+    for c in out:
+        if merged and len(c[1]) < MIN_CHUNK and merged[-1][0] == c[0]:
+            merged[-1][1] += "\n" + c[1]; merged[-1][3] = c[3]
+        else:
+            merged.append(c)
+    # A document with any content always yields at least one chunk.
+    if not merged:
+        t = text.strip()
+        if t: merged = [["", t, offset + 1, offset + len(lines) + 1]]
+
+    # Final guard: hard-split on character count. Line-based splitting cannot help a
+    # file that is ONE line — the worst case in the live corpus was a single
+    # 6,041,077-character line, which line splitting left entirely intact.
+    for h, t, a, b in merged:
+        if len(t) <= MAX_CHARS:
+            yield h, t, a, b
+        else:
+            for i in range(0, len(t), MAX_CHARS):
+                yield h, t[i:i + MAX_CHARS], a, b
 
 
 # ── database ──────────────────────────────────────────────────────────────────
@@ -156,7 +197,7 @@ CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY, path TEXT UNIQUE, root TEXT, tier TEXT,
   mtime REAL, hash TEXT, title TEXT, date TEXT, indexed_at REAL);
 CREATE TABLE IF NOT EXISTS chunks(
-  id INTEGER PRIMARY KEY, doc_id INTEGER, ord INTEGER, heading TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id INTEGER, ord INTEGER, heading TEXT,
   text TEXT, start_line INTEGER, end_line INTEGER,
   FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS meta(doc_id INTEGER, key TEXT, value TEXT);
@@ -253,9 +294,19 @@ def vector_ids(c, query, k=200):
         return []
 
 
+def drop_vectors(c, doc_id):
+    """A vector outlives its chunk unless explicitly removed, and SQLite reuses freed
+    rowids — so without this an edited document's new text is served by the OLD text's
+    embedding, while `stat` reports 100% embedded. Verified reproducible."""
+    try:
+        c.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
+    except sqlite3.OperationalError:
+        pass          # vector table absent; nothing to clean
+
+
 def index_cmd(args):
     man = load_manifest()
-    c = connect()
+    c = connect(vec=True)
     existing = {r[0]: (r[1], r[2]) for r in c.execute("SELECT path, hash, id FROM documents")}
     t0 = time.time()
     seen, added, updated, chunks_n = set(), 0, 0, 0
@@ -265,6 +316,11 @@ def index_cmd(args):
         try:
             raw = p.read_text(errors="ignore")
         except Exception:
+            continue
+        # NUL bytes mean this is not text, whatever the extension says. macOS
+        # AppleDouble files (._*) are markdown by name and binary by content, and
+        # 473 of them were indexed as chunks of unsearchable garbage.
+        if "\x00" in raw[:4096]:
             continue
         h = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:16]
         prev = existing.get(sp)
@@ -278,6 +334,7 @@ def index_cmd(args):
         if isinstance(date, list): date = date[0] if date else ""
 
         if prev:
+            drop_vectors(c, prev[1])
             c.execute("DELETE FROM chunks WHERE doc_id=?", (prev[1],))
             c.execute("DELETE FROM meta WHERE doc_id=?", (prev[1],))
             c.execute("DELETE FROM links WHERE doc_id=?", (prev[1],))
@@ -295,7 +352,21 @@ def index_cmd(args):
         for t in set(LINK_RE.findall(raw)):
             c.execute("INSERT INTO links(doc_id,target) VALUES(?,?)", (doc_id, t.strip()[:200]))
 
-        for i, (head, txt, s, e) in enumerate(chunk(body, off)):
+        # A document whose body is empty but whose frontmatter carries a title and
+        # summary is still worth finding — Reader saves a lot of these (a tweet, a
+        # link with no extractable text). Index the metadata rather than nothing.
+        pieces = list(chunk(body, off))
+        if not pieces:
+            # Vault entity pages are often pure frontmatter — type, ideology,
+            # affiliation, no body. 72 were indexed with zero chunks and were
+            # unfindable by their own name. Card = title plus every property value.
+            vals = []
+            for k, v in fm.items():
+                for vv in (v if isinstance(v, list) else [v]):
+                    if vv and not str(vv).startswith(("http", "![")): vals.append(f"{k}: {vv}")
+            card = (str(title) + "\n" + "\n".join(vals)).strip()
+            if card: pieces = [("", card, 1, 1)]
+        for i, (head, txt, s, e) in enumerate(pieces):
             cur = c.execute("INSERT INTO chunks(doc_id,ord,heading,text,start_line,end_line) VALUES(?,?,?,?,?,?)",
                             (doc_id, i, head[:200], txt, s, e))
             c.execute("INSERT INTO chunks_fts(rowid,text) VALUES(?,?)", (cur.lastrowid, txt))
@@ -305,6 +376,8 @@ def index_cmd(args):
 
     gone = [pth for pth in existing if pth not in seen]
     for pth in gone:
+        row = c.execute("SELECT id FROM documents WHERE path=?", (pth,)).fetchone()
+        if row: drop_vectors(c, row[0])
         c.execute("DELETE FROM chunks WHERE doc_id=(SELECT id FROM documents WHERE path=?)", (pth,))
         c.execute("DELETE FROM documents WHERE path=?", (pth,))
     c.commit()
@@ -312,6 +385,15 @@ def index_cmd(args):
     n_docs = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     print(f"{added} new, {updated} changed, {len(gone)} removed | {n_docs} docs, {n_chunks} chunks | {time.time()-t0:.0f}s")
+
+
+def fts_query(q, raw=False):
+    """FTS5 treats `-`, `\'`, `:` and bare NOT/AND/OR as syntax. Ordinary journalist
+    queries — far-right, O\'Brien, Mar-a-Lago — raised OperationalError. Quote every
+    term as a phrase unless --raw is passed."""
+    if raw: return q
+    terms = [t for t in re.split(r'\s+', q.strip()) if t]
+    return " ".join('"' + t.replace('"', '""') + '"' for t in terms) or '""'
 
 
 def _rows(c, q, tiers, since, project, limit):
@@ -365,7 +447,7 @@ def find_cmd(a):
     """Lexical by default — fast, no model load. --semantic adds vector recall and
     fuses by reciprocal rank, so bm25 and cosine scales never have to be reconciled."""
     c = connect(vec=a.semantic)
-    lex = _rows(c, a.query, a.tier, a.since, a.project, max(a.limit * 4, 40))
+    lex = _rows(c, fts_query(a.query, getattr(a, 'raw', False)), a.tier, a.since, a.project, max(a.limit * 4, 40))
     if not a.semantic:
         show(lex[:a.limit], a.json); return
 
@@ -390,7 +472,7 @@ def sweep_cmd(a):
     corrections protocol exists to catch the same claim phrased differently, which
     is exactly what lexical search cannot do."""
     c = connect(vec=not a.no_semantic)
-    rows = list(_rows(c, a.query, a.tier, None, None, 400))
+    rows = list(_rows(c, fts_query(a.query, getattr(a, 'raw', False)), a.tier, None, None, 400))
     if not a.no_semantic:
         have = {(r[0], r[4]) for r in rows}
         vrows = _rows_by_ids(c, vector_ids(c, a.query, k=300), a.tier)
@@ -431,6 +513,12 @@ def stat_cmd(a):
                   + ("" if ev >= tc else f" — `vault-search embed` for the remaining {tc-ev}"))
         except Exception:
             print("  embedded: 0 chunks — run `vault-search embed`")
+        try:
+            orph = c.execute("SELECT COUNT(*) FROM vec_chunks v WHERE NOT EXISTS"
+                             "(SELECT 1 FROM chunks c WHERE c.id = v.chunk_id)").fetchone()[0]
+            print(f"  orphaned vectors: {orph}" + ("" if orph == 0 else "  ← STALE, reindex and re-embed"))
+        except Exception:
+            pass
 
 
 def main():
@@ -441,10 +529,12 @@ def main():
     f.add_argument("--since"); f.add_argument("--project"); f.add_argument("--limit", type=int, default=10)
     f.add_argument("--json", action="store_true")
     f.add_argument("--semantic", action="store_true", help="add vector recall (loads the model, ~5s)")
+    f.add_argument("--raw", action="store_true", help="pass the query to FTS5 verbatim (AND/OR/NEAR syntax)")
     f.set_defaults(fn=find_cmd)
     s = sub.add_parser("sweep"); s.add_argument("query"); s.add_argument("--tier", action="append")
     s.add_argument("--frontmatter", action="store_true"); s.add_argument("--json", action="store_true")
     s.add_argument("--no-semantic", action="store_true", help="lexical only, skip the model load")
+    s.add_argument("--raw", action="store_true", help="pass the query to FTS5 verbatim")
     s.set_defaults(fn=sweep_cmd)
     l = sub.add_parser("links"); l.add_argument("entity"); l.add_argument("--limit", type=int, default=50)
     l.set_defaults(fn=links_cmd)

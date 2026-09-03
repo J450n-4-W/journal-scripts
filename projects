@@ -135,8 +135,12 @@ class Record:
         cands = [d for d in (self.mtime_activity(), self.log_activity(log_index)) if d]
         self.last_activity = max(cands) if cands else None
         self.days_quiet = (TODAY - self.last_activity).days if self.last_activity else None
-        # Published is terminal. Its working dir is deleted at closeout, so it would
-        # otherwise read as maximally quiet and win the abandoned slot forever.
+        # Published is terminal. NOTE: story-closeout does NOT delete the working
+        # directory — an earlier comment here claimed it did, which was wrong. The
+        # directories that are missing were removed by hand after closeout. Either
+        # way, published must not be demoted: a story whose dir is gone reads as
+        # maximally quiet, and one whose dir remains keeps accruing mtime from
+        # unrelated file activity. Both would win the abandoned slot wrongly.
         if self.status == "published":
             self.derived_status = "published"
         elif self.days_quiet is None or self.days_quiet >= SHELVE_DAYS:
