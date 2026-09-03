@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tomli; python_version<'3.11'"]
+# dependencies = ["tomli; python_version<'3.11'", "sqlite-vec", "fastembed"]
 # ///
 """vault-search — hybrid index over everything Jason has written, read or collected,
 so the prior-coverage and corrections rules stop depending on guessing the right grep.
@@ -32,6 +32,10 @@ DB = HOME/".local/state/vault-search.db"      # outside the vault: a vector stor
                                               # a repo with hourly autocommit is a disaster
 TARGET_CHARS = 2000
 MIN_CHUNK = 200
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+EMBED_DIM = 384
+RRF_K = 60          # reciprocal-rank-fusion constant; ranks, not scores, so the
+                    # bm25 and cosine scales never have to be reconciled
 
 
 # ── manifest ──────────────────────────────────────────────────────────────────
@@ -165,11 +169,88 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 """
 
 
-def connect():
+def connect(vec=False):
     DB.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
+    if vec and load_vec(c):
+        c.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0("
+                  f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBED_DIM}])")
     return c
+
+
+def load_vec(c):
+    """sqlite-vec is a loadable extension; Python's sqlite3 here has
+    enable_load_extension available (verified 2026-09-03)."""
+    try:
+        import sqlite_vec
+        c.enable_load_extension(True)
+        sqlite_vec.load(c)
+        c.enable_load_extension(False)
+        return True
+    except Exception as e:
+        print(f"vault-search: sqlite-vec unavailable ({e}); lexical only", file=sys.stderr)
+        return False
+
+
+def embed_texts(texts, show=False):
+    """fastembed has two settings that sound equivalent and are not: `threads` on the
+    constructor does nothing measurable; `parallel` on embed() spreads work across
+    cores and is worth 5.5x (2.6 -> 14.4 chunks/s). MUST be called under a
+    __main__ guard — it forks, and children re-import the calling module."""
+    from fastembed import TextEmbedding
+    model = TextEmbedding(model_name=EMBED_MODEL)
+    return model.embed(texts, batch_size=32, parallel=0)
+
+
+def embed_cmd(args):
+    import struct
+    c = connect(vec=True)
+    if not load_vec(c):
+        return 1
+    todo = c.execute("""SELECT ch.id, d.title, ch.heading, ch.text
+                        FROM chunks ch JOIN documents d ON d.id = ch.doc_id
+                        WHERE ch.id NOT IN (SELECT chunk_id FROM vec_chunks)
+                        ORDER BY ch.id""").fetchall()
+    if args.limit:
+        todo = todo[:args.limit]
+    if not todo:
+        print("all chunks embedded"); return 0
+    print(f"{len(todo)} chunks to embed (~{len(todo)/14.4/60:.0f} min at measured throughput)")
+    # Frontmatter prepended: a chunk from mid-document otherwise carries no signal
+    # about whose page it is.
+    texts = [f"{t or ''}\n{h or ''}\n{x}" for _, t, h, x in todo]
+    ids = [r[0] for r in todo]
+    t0, done = time.time(), 0
+    batch_ids, batch_vecs = [], []
+    for i, v in enumerate(embed_texts(texts)):
+        batch_ids.append(ids[i]); batch_vecs.append(v)
+        if len(batch_ids) >= 500:
+            c.executemany("INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
+                          [(cid, struct.pack(f"{EMBED_DIM}f", *vv)) for cid, vv in zip(batch_ids, batch_vecs)])
+            c.commit(); done += len(batch_ids); batch_ids, batch_vecs = [], []
+            el = time.time()-t0
+            print(f"  {done}/{len(todo)}  {done/el:.1f}/s  eta {(len(todo)-done)/max(done/el,0.1)/60:.0f}m", file=sys.stderr)
+    if batch_ids:
+        c.executemany("INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
+                      [(cid, struct.pack(f"{EMBED_DIM}f", *vv)) for cid, vv in zip(batch_ids, batch_vecs)])
+        c.commit(); done += len(batch_ids)
+    print(f"embedded {done} chunks in {(time.time()-t0)/60:.1f} min")
+    return 0
+
+
+def vector_ids(c, query, k=200):
+    """Returns [chunk_id] ranked by cosine distance, or [] if unavailable."""
+    import struct
+    try:
+        qv = list(embed_texts([query]))[0]
+        rows = c.execute("SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
+                         "ORDER BY distance LIMIT ?",
+                         (struct.pack(f"{EMBED_DIM}f", *qv), k)).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        print(f"vault-search: vector search unavailable ({e})", file=sys.stderr)
+        return []
 
 
 def index_cmd(args):
@@ -269,14 +350,53 @@ def show(rows, as_json, sweep=False):
         print(f"  {' '.join(text.split())[:260]}")
 
 
+def _rows_by_ids(c, ids, tiers):
+    if not ids: return []
+    q = f"""SELECT ch.id, d.path, d.tier, d.title, d.date, ch.start_line, ch.heading, ch.text
+            FROM chunks ch JOIN documents d ON d.id = ch.doc_id
+            WHERE ch.id IN ({','.join('?'*len(ids))})"""
+    p = list(ids)
+    if tiers:
+        q += f" AND d.tier IN ({','.join('?'*len(tiers))})"; p += tiers
+    return {r[0]: r[1:] for r in c.execute(q, p)}
+
+
 def find_cmd(a):
-    c = connect()
-    show(_rows(c, a.query, a.tier, a.since, a.project, a.limit), a.json)
+    """Lexical by default — fast, no model load. --semantic adds vector recall and
+    fuses by reciprocal rank, so bm25 and cosine scales never have to be reconciled."""
+    c = connect(vec=a.semantic)
+    lex = _rows(c, a.query, a.tier, a.since, a.project, max(a.limit * 4, 40))
+    if not a.semantic:
+        show(lex[:a.limit], a.json); return
+
+    fused = {}
+    for rank, r in enumerate(lex):
+        fused[(r[0], r[4])] = fused.get((r[0], r[4]), 0) + 1.0 / (RRF_K + rank)
+    vids = vector_ids(c, a.query, k=200)
+    vrows = _rows_by_ids(c, vids, a.tier)
+    order = {cid: i for i, cid in enumerate(vids)}
+    for cid, row in vrows.items():
+        key = (row[0], row[4])
+        fused[key] = fused.get(key, 0) + 1.0 / (RRF_K + order.get(cid, 999))
+    lookup = {(r[0], r[4]): r for r in lex}
+    for cid, row in vrows.items():
+        lookup.setdefault((row[0], row[4]), (row[0], row[1], row[2], row[3], row[4], row[5], row[6], 0.0))
+    ranked = [lookup[k] for k in sorted(fused, key=lambda k: -fused[k]) if k in lookup]
+    show(ranked[:a.limit], a.json)
 
 
 def sweep_cmd(a):
-    c = connect()
-    rows = _rows(c, a.query, a.tier, None, None, 400)
+    """Recall, not precision. Vector recall is on by default here because the
+    corrections protocol exists to catch the same claim phrased differently, which
+    is exactly what lexical search cannot do."""
+    c = connect(vec=not a.no_semantic)
+    rows = list(_rows(c, a.query, a.tier, None, None, 400))
+    if not a.no_semantic:
+        have = {(r[0], r[4]) for r in rows}
+        vrows = _rows_by_ids(c, vector_ids(c, a.query, k=300), a.tier)
+        for row in vrows.values():
+            if (row[0], row[4]) not in have:
+                rows.append((row[0], row[1], row[2], row[3], row[4], row[5], row[6], 0.0))
     show(rows, a.json, sweep=True)
     if a.frontmatter:
         hits = c.execute("SELECT DISTINCT d.path, m.key, m.value FROM meta m JOIN documents d ON d.id=m.doc_id "
@@ -304,6 +424,13 @@ def stat_cmd(a):
     tot = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     tc = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     print(f"  {'TOTAL':12} {tot:6} docs  {tc:8} chunks")
+    if load_vec(c):
+        try:
+            ev = c.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0]
+            print(f"  embedded: {ev}/{tc} chunks ({100*ev/max(tc,1):.0f}%)"
+                  + ("" if ev >= tc else f" — `vault-search embed` for the remaining {tc-ev}"))
+        except Exception:
+            print("  embedded: 0 chunks — run `vault-search embed`")
 
 
 def main():
@@ -312,12 +439,18 @@ def main():
     i = sub.add_parser("index"); i.add_argument("--force", action="store_true"); i.set_defaults(fn=index_cmd)
     f = sub.add_parser("find"); f.add_argument("query"); f.add_argument("--tier", action="append")
     f.add_argument("--since"); f.add_argument("--project"); f.add_argument("--limit", type=int, default=10)
-    f.add_argument("--json", action="store_true"); f.set_defaults(fn=find_cmd)
+    f.add_argument("--json", action="store_true")
+    f.add_argument("--semantic", action="store_true", help="add vector recall (loads the model, ~5s)")
+    f.set_defaults(fn=find_cmd)
     s = sub.add_parser("sweep"); s.add_argument("query"); s.add_argument("--tier", action="append")
     s.add_argument("--frontmatter", action="store_true"); s.add_argument("--json", action="store_true")
+    s.add_argument("--no-semantic", action="store_true", help="lexical only, skip the model load")
     s.set_defaults(fn=sweep_cmd)
     l = sub.add_parser("links"); l.add_argument("entity"); l.add_argument("--limit", type=int, default=50)
     l.set_defaults(fn=links_cmd)
+    e = sub.add_parser("embed", help="compute missing chunk embeddings (resumable)")
+    e.add_argument("--limit", type=int, default=0, help="stop after N chunks; resumable, so safe to run in slices")
+    e.set_defaults(fn=embed_cmd)
     st = sub.add_parser("stat"); st.set_defaults(fn=stat_cmd)
     a = ap.parse_args(); return a.fn(a) or 0
 
