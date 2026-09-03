@@ -34,6 +34,12 @@ TARGET_CHARS = 2000
 MAX_CHARS = 6000      # hard ceiling: a file with no blank lines must still split
 MIN_CHUNK = 200
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Each fastembed worker loads its OWN copy of the ONNX model, ~1.4GB resident. With
+# parallel=0 that is one worker per core: 32 workers = ~45GB, which took a 92GB
+# machine into swap at 93% and load 40. Cap it, and size it against free memory
+# rather than core count.
+EMBED_WORKERS = 6
+SLICE = 5000          # commit progress every N chunks; bounds parent memory too
 EMBED_DIM = 384
 RRF_K = 60          # reciprocal-rank-fusion constant; ranks, not scores, so the
                     # bm25 and cosine scales never have to be reconciled
@@ -234,18 +240,52 @@ def load_vec(c):
         return False
 
 
-def embed_texts(texts, show=False):
-    """fastembed has two settings that sound equivalent and are not: `threads` on the
-    constructor does nothing measurable; `parallel` on embed() spreads work across
-    cores and is worth 5.5x (2.6 -> 14.4 chunks/s). MUST be called under a
-    __main__ guard — it forks, and children re-import the calling module."""
+def embed_workers():
+    """Never more workers than memory allows. 1.4GB per worker, measured."""
+    try:
+        avail = int([l.split()[1] for l in open("/proc/meminfo")
+                     if l.startswith("MemAvailable")][0]) * 1024
+        by_mem = max(1, int(avail * 0.5 // (1.5 * 1024**3)))
+    except Exception:
+        by_mem = 2
+    return max(1, min(EMBED_WORKERS, by_mem, (os.cpu_count() or 4) - 2))
+
+
+def embed_texts(texts, workers=None):
+    """`parallel` on embed() spreads work across processes and is worth ~5.5x over the
+    default; `threads` on the constructor does nothing measurable. MUST be called under
+    a __main__ guard — it forks, and children re-import the calling module.
+
+    parallel=0 means one worker PER CORE, and each worker holds its own ~1.4GB model.
+    That is not a throughput knob, it is a memory multiplier. Bounded here."""
     from fastembed import TextEmbedding
     model = TextEmbedding(model_name=EMBED_MODEL)
-    return model.embed(texts, batch_size=32, parallel=0)
+    return model.embed(texts, batch_size=32, parallel=workers or embed_workers())
 
 
 def embed_cmd(args):
     import struct
+    # A killed parent orphans its workers — they keep running and keep their memory.
+    # Starting a second run on top of the first is what put the machine into swap.
+    lock = HOME/".local/state/vault-search-embed.lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text().strip())
+            os.kill(pid, 0)
+            print(f"vault-search: embed already running (pid {pid}); refusing to start a second.\n"
+                  f"  If that pid is dead, remove {lock}", file=sys.stderr)
+            return 1
+        except (ValueError, ProcessLookupError, PermissionError):
+            lock.unlink(missing_ok=True)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(os.getpid()))
+    try:
+        return _embed_run(args, struct)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _embed_run(args, struct):
     c = connect(vec=True)
     if not load_vec(c):
         return 1
@@ -260,22 +300,26 @@ def embed_cmd(args):
     print(f"{len(todo)} chunks to embed (~{len(todo)/14.4/60:.0f} min at measured throughput)")
     # Frontmatter prepended: a chunk from mid-document otherwise carries no signal
     # about whose page it is.
-    texts = [f"{t or ''}\n{h or ''}\n{x}" for _, t, h, x in todo]
-    ids = [r[0] for r in todo]
+    w = embed_workers()
+    print(f"  {w} worker(s) (~{w * 1.4:.0f}GB); slices of {SLICE}", file=sys.stderr)
     t0, done = time.time(), 0
-    batch_ids, batch_vecs = [], []
-    for i, v in enumerate(embed_texts(texts)):
-        batch_ids.append(ids[i]); batch_vecs.append(v)
-        if len(batch_ids) >= 500:
+    for lo in range(0, len(todo), SLICE):
+        sl = todo[lo:lo + SLICE]
+        texts = [f"{t or ''}\n{h or ''}\n{x}" for _, t, h, x in sl]
+        ids = [r[0] for r in sl]
+        batch_ids, batch_vecs = [], []
+        for i, v in enumerate(embed_texts(texts, workers=w)):
+            batch_ids.append(ids[i]); batch_vecs.append(v)
+            if len(batch_ids) >= 500:
+                c.executemany("INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
+                              [(cid, struct.pack(f"{EMBED_DIM}f", *vv)) for cid, vv in zip(batch_ids, batch_vecs)])
+                c.commit(); done += len(batch_ids); batch_ids, batch_vecs = [], []
+                el = time.time() - t0
+                print(f"  {done}/{len(todo)}  {done/el:.1f}/s  eta {(len(todo)-done)/max(done/el,0.1)/60:.0f}m", file=sys.stderr)
+        if batch_ids:
             c.executemany("INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
                           [(cid, struct.pack(f"{EMBED_DIM}f", *vv)) for cid, vv in zip(batch_ids, batch_vecs)])
-            c.commit(); done += len(batch_ids); batch_ids, batch_vecs = [], []
-            el = time.time()-t0
-            print(f"  {done}/{len(todo)}  {done/el:.1f}/s  eta {(len(todo)-done)/max(done/el,0.1)/60:.0f}m", file=sys.stderr)
-    if batch_ids:
-        c.executemany("INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
-                      [(cid, struct.pack(f"{EMBED_DIM}f", *vv)) for cid, vv in zip(batch_ids, batch_vecs)])
-        c.commit(); done += len(batch_ids)
+            c.commit(); done += len(batch_ids)
     print(f"embedded {done} chunks in {(time.time()-t0)/60:.1f} min")
     return 0
 
