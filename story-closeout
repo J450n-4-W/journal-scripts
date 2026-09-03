@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # story-closeout — archive a Guardian story folder into the PKM vault and media archive
 #
-# Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM]
+# Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM] [--dry-run]
 #
 # Text files   → ~/notebook/archive/          (flat, tagged by frontmatter)
 # Small docs   → ~/notebook/assets/<slug>/    (PDFs, EPUBs, DOCXs, CSVs, JSONs, DBs, ZIPs)
@@ -10,6 +10,11 @@
 #
 # Does NOT modify text source files — copies to vault.
 # DOES move media files (video/audio) to free NVMe space.
+#
+# Anything the script decides NOT to take is printed, never dropped silently:
+# .txt files that don't look like transcripts, and subdirectories holding .md
+# that didn't match a clip-directory name. Read those lists — they are where
+# real material hides. Use --dry-run first on an unfamiliar folder.
 
 set -euo pipefail
 
@@ -23,14 +28,15 @@ EXT_MOUNT="$(findmnt -rno TARGET LABEL=4tb-external 2>/dev/null | head -1)"
 MEDIA_ARCHIVE="${EXT_MOUNT:-/media/jason/4tb-external1}/Reporting_Media_Archive"
 
 usage() {
-    echo "Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM]"
+    echo "Usage: story-closeout <story-directory> [--slug NAME] [--date YYYY_MM] [--dry-run]"
     echo ""
     echo "  <story-directory>  Path to the Guardian story folder"
     echo "  --slug NAME        Override the directory name for archive/assets subfolders"
     echo "  --date YYYY_MM     Reporting date prefix for media archive (e.g. 2026_03)"
     echo "                     Defaults to current year_month"
+    echo "  --dry-run, -n      Print every copy/move that would happen, change nothing"
     echo ""
-    echo "Example: story-closeout ~/Guardian/old_stories/Schwemmer --date 2026_03"
+    echo "Example: story-closeout ~/Investigations/old_stories/Schwemmer --date 2026_03"
     exit 1
 }
 
@@ -41,10 +47,12 @@ shift
 
 SLUG=""
 DATE_PREFIX=""
+DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --slug) SLUG="$2"; shift 2 ;;
         --date) DATE_PREFIX="$2"; shift 2 ;;
+        --dry-run|-n) DRY_RUN=1; shift ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
@@ -61,6 +69,7 @@ STORY_DIR="$(realpath "$STORY_DIR")"
 MEDIA_DEST="$MEDIA_ARCHIVE/${DATE_PREFIX}_${SLUG}"
 
 echo "Story closeout: $STORY_DIR"
+[[ $DRY_RUN -eq 1 ]] && echo "*** DRY RUN — nothing will be copied, moved or created ***"
 echo "Slug: $SLUG"
 echo "Vault: $VAULT"
 echo "  Archive (text):  $ARCHIVE"
@@ -68,7 +77,13 @@ echo "  Assets (docs):   $ASSETS/$SLUG/"
 echo "  Media (video/audio): $MEDIA_DEST/"
 echo "---"
 
-mkdir -p "$ARCHIVE"
+# Dry-run-aware filesystem wrappers. Every write in this script goes through one
+# of these, so --dry-run is total rather than best-effort.
+do_mkdir() { [[ $DRY_RUN -eq 1 ]] || mkdir -p "$1"; }
+do_cp()    { if [[ $DRY_RUN -eq 1 ]]; then echo "  would copy: $(basename "$1")"; else cp "$1" "$2"; fi; }
+do_mv()    { if [[ $DRY_RUN -eq 1 ]]; then echo "  would MOVE: $(basename "$1")"; else mv "$1" "$2"; fi; }
+
+do_mkdir "$ARCHIVE"
 
 # Counters
 copied_published=0
@@ -78,10 +93,23 @@ copied_ror=0
 copied_assets=0
 moved_media=0
 
-# Helper: check basename collision
+# Things deliberately not taken — reported at the end so nothing vanishes quietly
+skipped_txt=()
+unmatched_md_dirs=()
+
+# Helper: check basename collision.
+# In dry-run nothing actually lands, so also remember what this run has already
+# claimed — otherwise a name appearing twice in the tree (ror/files (1)/ and
+# ror/extracted/ hold the same 12 letters) is reported as two copies when the
+# real run would take one and skip the other.
+declare -A planned_dests=()
 check_collision() {
     local basename="$1"
     local dest_dir="${2:-$ARCHIVE}"
+    if [[ $DRY_RUN -eq 1 && -n "${planned_dests["$dest_dir/$basename"]:-}" ]]; then
+        echo "  WARNING: already taken earlier in this run — skipping $basename"
+        return 1
+    fi
     if [[ -f "$dest_dir/$basename" ]]; then
         echo "  WARNING: file already exists — skipping $basename"
         return 1
@@ -92,6 +120,7 @@ check_collision() {
         echo "  WARNING: basename collision with pages/ — skipping $basename"
         return 1
     fi
+    [[ $DRY_RUN -eq 1 ]] && planned_dests["$dest_dir/$basename"]=1
     return 0
 }
 
@@ -100,12 +129,34 @@ check_collision() {
 # ============================================================
 
 # --- Published article ---
-published_files="$(find "$STORY_DIR" -maxdepth 1 -iname '*guardian*.md' -type f || true)"
+# Filename alone is not enough: web-clipper names come from the page <title>, and
+# a Guardian <title> is "<headline> | <tag> | The Guardian" only some of the time
+# (rededicate-250's ends "... | Trump administration"). So also accept any
+# top-level .md whose FRONTMATTER source/url points at theguardian.com. Checking
+# the frontmatter rather than the body matters — drafts quote Guardian links in
+# their prose and would otherwise match.
+has_guardian_frontmatter() {
+    awk '
+        NR==1 && $0!="---" { exit 1 }
+        NR>1 && $0=="---"  { exit 1 }
+        NR>1 && /^(source|url):[[:space:]]*"?https?:\/\/(www\.)?theguardian\.com\// { exit 0 }
+        NR>200 { exit 1 }
+    ' "$1"
+}
+
+published_files="$(
+    {
+        find "$STORY_DIR" -maxdepth 1 -iname '*guardian*.md' -type f
+        while IFS= read -r f; do
+            has_guardian_frontmatter "$f" && printf '%s\n' "$f"
+        done < <(find "$STORY_DIR" -maxdepth 1 -name '*.md' -type f)
+    } | sort -u || true
+)"
 if [[ -n "$published_files" ]]; then
     while IFS= read -r f; do
         dest_name="$(basename "$f")"
         if check_collision "$dest_name"; then
-            cp "$f" "$ARCHIVE/$dest_name"
+            do_cp "$f" "$ARCHIVE/$dest_name"
             copied_published=$((copied_published + 1))
         fi
     done <<< "$published_files"
@@ -116,50 +167,117 @@ else
 fi
 
 # --- Transcripts ---
-transcript_files="$(find "$STORY_DIR" -name '*.txt' ! -name '*-timestamped.txt' -type f || true)"
-if [[ -n "$transcript_files" ]]; then
+# A blanket recursive *.txt sweep is wrong: story folders also hold directory
+# listings, FOIA email dumps and scratch notes as .txt, and those land in flat
+# archive/ looking like interviews. Require positive evidence that a .txt IS a
+# transcript — the name says so, or a sibling with the same basename is the
+# media/subtitle/timestamped output it was produced from. Everything rejected is
+# listed at the end for manual review.
+looks_like_transcript() {
+    local f="$1"
+    local dir stem
+    dir="$(dirname "$f")"
+    stem="$(basename "$f" .txt)"
+
+    # Named as one — covers *.transcript.txt and anything with "transcript" in it
+    shopt -s nocasematch
+    if [[ "$stem" == *transcript* ]]; then shopt -u nocasematch; return 0; fi
+    shopt -u nocasematch
+
+    # Produced alongside its own subtitle or timestamped output
+    [[ -f "$dir/$stem.srt" || -f "$dir/$stem-timestamped.txt" ]] && return 0
+
+    # Produced from a media file of the same name. Check the media archive too,
+    # so a re-run after the media has been moved still recognises it.
+    local ext
+    for ext in mp3 mp4 webm m4a mkv wav flac; do
+        [[ -f "$dir/$stem.$ext" ]] && return 0
+        [[ -f "$MEDIA_DEST/$stem.$ext" ]] && return 0
+    done
+    return 1
+}
+
+txt_candidates="$(find "$STORY_DIR" -name '*.txt' ! -name '*-timestamped.txt' -type f || true)"
+if [[ -n "$txt_candidates" ]]; then
     while IFS= read -r f; do
+        if ! looks_like_transcript "$f"; then
+            skipped_txt+=("${f#"$STORY_DIR"/}")
+            continue
+        fi
         dest_name="$(basename "$f" .txt).md"
         if check_collision "$dest_name"; then
-            cp "$f" "$ARCHIVE/$dest_name"
+            do_cp "$f" "$ARCHIVE/$dest_name"
             copied_transcripts=$((copied_transcripts + 1))
         fi
-    done <<< "$transcript_files"
-    echo "Transcripts: copied $copied_transcripts"
+    done <<< "$txt_candidates"
+    echo "Transcripts: copied $copied_transcripts (${#skipped_txt[@]} .txt skipped as non-transcript)"
 else
     echo "Transcripts: none found"
 fi
 
-# --- Background and Coverage clips ---
+# --- Background / Coverage / Books clips ---
+# Match clip directories by NAME PATTERN, not by two hardcoded literals. Real
+# folders use rogers-coverage/, previous-coverage/, coverage/, Books/ — all of
+# which the old exact-match test walked straight past.
 copy_clip_dir() {
     local src_dir="$1"
     local label="$2"
-    if [[ -d "$src_dir" ]]; then
-        local count=0
-        while IFS= read -r f; do
-            dest_name="$(basename "$f")"
-            if check_collision "$dest_name"; then
-                cp "$f" "$ARCHIVE/$dest_name"
-                count=$((count + 1))
-            fi
-        done < <(find "$src_dir" -name '*.md' -type f)
-        copied_clips=$((copied_clips + count))
-        echo "$label: copied $count"
-    else
-        echo "$label: not found"
-    fi
+    local count=0
+    while IFS= read -r f; do
+        dest_name="$(basename "$f")"
+        if check_collision "$dest_name"; then
+            do_cp "$f" "$ARCHIVE/$dest_name"
+            count=$((count + 1))
+        fi
+    done < <(find "$src_dir" -name '*.md' -type f)
+    copied_clips=$((copied_clips + count))
+    echo "$label: copied $count"
 }
 
-copy_clip_dir "$STORY_DIR/Background" "Background/"
-copy_clip_dir "$STORY_DIR/Coverage" "Coverage/"
+is_clip_dir() {
+    local n="${1,,}"
+    [[ "$n" == *coverage* || "$n" == *background* || "$n" == *clip* || "$n" == books ]]
+}
+
+# A directory whose .md files are all RoR letters is already fully handled by the
+# recursive RoR pass below — don't report it as unhandled.
+all_md_are_ror() {
+    local d="$1" f base
+    while IFS= read -r f; do
+        base="$(basename "$f")"
+        shopt -s nocasematch
+        if [[ "$base" != ror*.md && "$base" != *_ror.md && "$base" != *-ror.md ]]; then
+            shopt -u nocasematch; return 1
+        fi
+        shopt -u nocasematch
+    done < <(find "$d" -name '*.md' -type f)
+    return 0
+}
+
+clip_dirs_found=0
+while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    rel="${d#"$STORY_DIR"/}"
+    if is_clip_dir "$(basename "$d")"; then
+        copy_clip_dir "$d" "$rel/"
+        clip_dirs_found=$((clip_dirs_found + 1))
+    elif ! all_md_are_ror "$d"; then
+        unmatched_md_dirs+=("$rel")
+    fi
+done < <(find "$STORY_DIR" -mindepth 1 -type d -exec sh -c 'ls "$1"/*.md >/dev/null 2>&1' _ {} \; -print 2>/dev/null | sort || true)
+
+[[ $clip_dirs_found -eq 0 ]] && echo "Clip directories: none matched (*coverage*, *background*, *clip*, books)"
 
 # --- RoR files ---
-ror_files="$(find "$STORY_DIR" -maxdepth 1 \( -name 'RoR*.md' -o -name '*_ROR.md' -o -name '*_ror.md' \) -type f || true)"
+# Recursive, not maxdepth 1: ror/ subdirectories are the norm (Israel_Trips,
+# rededicate-250 both hold dozens there). Case-insensitive and hyphen-tolerant so
+# rogers-ror.md matches as well as Beck_ROR.md and RORHegseth.md.
+ror_files="$(find "$STORY_DIR" \( -iname 'ror*.md' -o -iname '*_ror.md' -o -iname '*-ror.md' \) -type f || true)"
 if [[ -n "$ror_files" ]]; then
     while IFS= read -r f; do
         dest_name="$(basename "$f")"
         if check_collision "$dest_name"; then
-            cp "$f" "$ARCHIVE/$dest_name"
+            do_cp "$f" "$ARCHIVE/$dest_name"
             copied_ror=$((copied_ror + 1))
         fi
     done <<< "$ror_files"
@@ -179,11 +297,11 @@ doc_files="$(find "$STORY_DIR" \( \
     \) -type f || true)"
 
 if [[ -n "$doc_files" ]]; then
-    mkdir -p "$ASSETS/$SLUG"
+    do_mkdir "$ASSETS/$SLUG"
     while IFS= read -r f; do
         dest_name="$(basename "$f")"
         if [[ ! -f "$ASSETS/$SLUG/$dest_name" ]]; then
-            cp "$f" "$ASSETS/$SLUG/$dest_name"
+            do_cp "$f" "$ASSETS/$SLUG/$dest_name"
             copied_assets=$((copied_assets + 1))
         else
             echo "  WARNING: already exists in assets — skipping $dest_name"
@@ -208,11 +326,11 @@ if [[ -n "$media_files" ]]; then
         echo "Media: ⚠ external SSD (LABEL=4tb-external) not mounted/writable — SKIPPING media move"
         echo "  Run again when the drive is mounted, or move manually to $MEDIA_DEST/"
     else
-        mkdir -p "$MEDIA_DEST"
+        do_mkdir "$MEDIA_DEST"
         while IFS= read -r f; do
             dest_name="$(basename "$f")"
             if [[ ! -f "$MEDIA_DEST/$dest_name" ]]; then
-                mv "$f" "$MEDIA_DEST/$dest_name"
+                do_mv "$f" "$MEDIA_DEST/$dest_name"
                 moved_media=$((moved_media + 1))
             else
                 echo "  WARNING: already exists in media archive — skipping $dest_name"
@@ -232,11 +350,16 @@ skipped="$(find "$STORY_DIR" \( \
     -name '*.srt' -o -name '*-timestamped.txt' -o -name '*.py' \
     \) -type f | wc -l)"
 
-# Working .md files
-working_files="$(find "$STORY_DIR" -maxdepth 1 -name '*.md' -type f \
-    ! -name 'RoR*.md' ! -name '*_ROR.md' ! -name '*_ror.md' \
-    ! -iname '*guardian*.md' \
-    || true)"
+# Working .md files — exclusions must mirror what was already taken above, or a
+# file copied as an RoR or as the published article gets listed again here as an
+# unhandled working note.
+working_files="$(
+    find "$STORY_DIR" -maxdepth 1 -name '*.md' -type f \
+        ! -iname 'ror*.md' ! -iname '*_ror.md' ! -iname '*-ror.md' \
+        ! -iname '*guardian*.md' \
+    | { if [[ -n "$published_files" ]]; then grep -vxF -f <(printf '%s\n' "$published_files"); else cat; fi; } \
+    || true
+)"
 
 # ============================================================
 # SUMMARY
@@ -256,6 +379,25 @@ if [[ -n "$working_files" ]]; then
         echo "  $(basename "$f")"
     done <<< "$working_files"
     echo ""
+fi
+
+if [[ ${#unmatched_md_dirs[@]} -gt 0 ]]; then
+    echo "Subdirectories holding .md that were NOT treated as clips (check these —"
+    echo "rename to *coverage*/*background*/*clip*/books and re-run if they are):"
+    for d in "${unmatched_md_dirs[@]}"; do echo "  $d/"; done
+    echo ""
+fi
+
+if [[ ${#skipped_txt[@]} -gt 0 ]]; then
+    echo ".txt files skipped as non-transcript (no media/srt sibling, name doesn't say"
+    echo "transcript). If one of these IS an interview, copy it to $ARCHIVE by hand:"
+    for f in "${skipped_txt[@]}"; do echo "  $f"; done
+    echo ""
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "*** DRY RUN — nothing was changed. Re-run without --dry-run to apply. ***"
+    exit 0
 fi
 
 echo "Next steps (use Claude):"
