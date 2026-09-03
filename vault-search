@@ -1,0 +1,326 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["tomli; python_version<'3.11'"]
+# ///
+"""vault-search — hybrid index over everything Jason has written, read or collected,
+so the prior-coverage and corrections rules stop depending on guessing the right grep.
+
+Retrieval is a LOCATOR, not an answerer: it returns paths, line ranges and enough
+context to judge relevance, and the model then reads the actual file. Chunk boundaries
+mangle quotations, and the standing rule is to preserve exact quotes from source
+material — answering from fragments is how a subtly wrong quote ends up looking sourced.
+
+Two modes with opposite optimisations:
+  find  — top-k, ranked, precision. "What do I know about X."
+  sweep — everything above a low threshold, unranked, recall. "Where does this claim
+          appear." The corrections protocol needs this one; a top-10 result set is
+          actively wrong for it.
+
+Spec and measurements: ~/notebook/pages/vault-search.md
+"""
+import os, re, sys, json, time, sqlite3, hashlib, pathlib, fnmatch, argparse
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+HOME = pathlib.Path.home()
+MANIFEST = HOME/".config/vault-search/manifest.toml"
+DB = HOME/".local/state/vault-search.db"      # outside the vault: a vector store inside
+                                              # a repo with hourly autocommit is a disaster
+TARGET_CHARS = 2000
+MIN_CHUNK = 200
+
+
+# ── manifest ──────────────────────────────────────────────────────────────────
+
+def load_manifest():
+    with open(MANIFEST, "rb") as f:
+        m = tomllib.load(f)
+    lim = m.get("limits", {})
+    return {
+        "exts": {e.lower().lstrip(".") for e in lim.get("extensions", ["md"])},
+        "max_bytes": int(lim.get("max_file_mb", 8) * 1024 * 1024),
+        "min_chars": int(lim.get("min_chars", 120)),
+        "excludes": lim.get("exclude_globs", []),
+        "roots": m.get("root", []),
+    }
+
+
+def tier_for(rel, root):
+    for t in root.get("tier", []):
+        if fnmatch.fnmatch(rel, t["glob"]) or fnmatch.fnmatch(rel, t["glob"].rstrip("/*") + "/*"):
+            return t["tier"]
+    return root.get("default_tier", "notes")
+
+
+def scan(man):
+    """Yield (path, root_path, tier). Exclusion is by size and path, never by category —
+    Reader's Pdf category is half primary-source documents."""
+    seen = set()
+    for root in man["roots"]:
+        rp = pathlib.Path(os.path.expanduser(root["path"]))
+        if not rp.is_dir():
+            print(f"vault-search: root missing, skipped: {rp}", file=sys.stderr); continue
+        rp = rp.resolve()
+        for dirpath, dirnames, filenames in os.walk(rp):
+            d = pathlib.Path(dirpath)
+            rel_dir = str(d.relative_to(rp))
+            if any(fnmatch.fnmatch(str(d/"x"), g) for g in man["excludes"]):
+                dirnames[:] = []; continue
+            for fn in filenames:
+                p = d/fn
+                if p.suffix.lower().lstrip(".") not in man["exts"]: continue
+                rel = str(p.relative_to(rp))
+                if any(fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(str(p), g) for g in man["excludes"]):
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size > man["max_bytes"] or st.st_size < man["min_chars"]:
+                    continue
+                rp_res = p.resolve()
+                if rp_res in seen: continue     # ~/Guardian was a symlink to ~/Investigations
+                seen.add(rp_res)
+                yield p, rp, tier_for(rel, root)
+
+
+# ── parsing and chunking ──────────────────────────────────────────────────────
+
+FM_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n?', re.S)
+LINK_RE = re.compile(r'\[\[([^\]|#]+)')
+
+
+def split_frontmatter(text):
+    m = FM_RE.match(text)
+    return (m.group(1), text[m.end():], text[:m.end()].count("\n")) if m else ("", text, 0)
+
+
+def parse_frontmatter(fm):
+    out, key = {}, None
+    for line in fm.splitlines():
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_-]*:', line):
+            key, _, val = line.partition(":")
+            key = key.strip(); val = val.strip().strip('"\'')
+            if val.startswith("["):
+                out[key] = [x.strip().strip('"\'') for x in val.strip("[]").split(",") if x.strip()]
+            elif val:
+                out[key] = val
+            else:
+                out[key] = []
+        elif key and re.match(r'^\s*-\s+', line):
+            v = re.sub(r'^\s*-\s+', '', line).strip().strip('"\'')
+            if isinstance(out.get(key), list): out[key].append(v)
+            else: out[key] = [v]
+    return out
+
+
+def chunk(text, offset=0):
+    """Markdown-aware: split on headings, then pack paragraphs to TARGET_CHARS.
+    Yields (heading, text, start_line, end_line)."""
+    lines = text.splitlines()
+    sections, cur, head, start = [], [], "", 0
+    for i, ln in enumerate(lines):
+        if re.match(r'^#{1,6}\s+\S', ln):
+            if cur: sections.append((head, cur, start))
+            head, cur, start = ln.lstrip("#").strip(), [], i
+        else:
+            cur.append(ln)
+    if cur: sections.append((head, cur, start))
+
+    for head, body, start in sections:
+        buf, buf_start = [], start
+        for i, ln in enumerate(body):
+            buf.append(ln)
+            if sum(len(x) for x in buf) >= TARGET_CHARS and not ln.strip():
+                t = "\n".join(buf).strip()
+                if len(t) >= MIN_CHUNK:
+                    yield head, t, offset + buf_start + 1, offset + start + i + 1
+                buf, buf_start = [], start + i
+        t = "\n".join(buf).strip()
+        if len(t) >= MIN_CHUNK:
+            yield head, t, offset + buf_start + 1, offset + start + len(body) + 1
+
+
+# ── database ──────────────────────────────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS documents(
+  id INTEGER PRIMARY KEY, path TEXT UNIQUE, root TEXT, tier TEXT,
+  mtime REAL, hash TEXT, title TEXT, date TEXT, indexed_at REAL);
+CREATE TABLE IF NOT EXISTS chunks(
+  id INTEGER PRIMARY KEY, doc_id INTEGER, ord INTEGER, heading TEXT,
+  text TEXT, start_line INTEGER, end_line INTEGER,
+  FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS meta(doc_id INTEGER, key TEXT, value TEXT);
+CREATE TABLE IF NOT EXISTS links(doc_id INTEGER, target TEXT);
+CREATE INDEX IF NOT EXISTS ix_chunks_doc ON chunks(doc_id);
+CREATE INDEX IF NOT EXISTS ix_meta_kv ON meta(key, value);
+CREATE INDEX IF NOT EXISTS ix_links_t ON links(target);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+  text, content='chunks', content_rowid='id', tokenize='porter unicode61');
+"""
+
+
+def connect():
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.executescript(SCHEMA)
+    return c
+
+
+def index_cmd(args):
+    man = load_manifest()
+    c = connect()
+    existing = {r[0]: (r[1], r[2]) for r in c.execute("SELECT path, hash, id FROM documents")}
+    t0 = time.time()
+    seen, added, updated, chunks_n = set(), 0, 0, 0
+
+    for p, root, tier in scan(man):
+        sp = str(p); seen.add(sp)
+        try:
+            raw = p.read_text(errors="ignore")
+        except Exception:
+            continue
+        h = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:16]
+        prev = existing.get(sp)
+        if prev and prev[0] == h and not args.force:
+            continue
+        fm_raw, body, off = split_frontmatter(raw)
+        fm = parse_frontmatter(fm_raw)
+        title = fm.get("title") or p.stem
+        if isinstance(title, list): title = title[0] if title else p.stem
+        date = fm.get("date") or fm.get("published_date") or fm.get("saved_date") or ""
+        if isinstance(date, list): date = date[0] if date else ""
+
+        if prev:
+            c.execute("DELETE FROM chunks WHERE doc_id=?", (prev[1],))
+            c.execute("DELETE FROM meta WHERE doc_id=?", (prev[1],))
+            c.execute("DELETE FROM links WHERE doc_id=?", (prev[1],))
+            c.execute("UPDATE documents SET root=?,tier=?,mtime=?,hash=?,title=?,date=?,indexed_at=? WHERE id=?",
+                      (str(root), tier, p.stat().st_mtime, h, str(title)[:300], str(date)[:40], time.time(), prev[1]))
+            doc_id = prev[1]; updated += 1
+        else:
+            cur = c.execute("INSERT INTO documents(path,root,tier,mtime,hash,title,date,indexed_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (sp, str(root), tier, p.stat().st_mtime, h, str(title)[:300], str(date)[:40], time.time()))
+            doc_id = cur.lastrowid; added += 1
+
+        for k, v in fm.items():
+            for vv in (v if isinstance(v, list) else [v]):
+                if vv: c.execute("INSERT INTO meta(doc_id,key,value) VALUES(?,?,?)", (doc_id, k[:60], str(vv)[:300]))
+        for t in set(LINK_RE.findall(raw)):
+            c.execute("INSERT INTO links(doc_id,target) VALUES(?,?)", (doc_id, t.strip()[:200]))
+
+        for i, (head, txt, s, e) in enumerate(chunk(body, off)):
+            cur = c.execute("INSERT INTO chunks(doc_id,ord,heading,text,start_line,end_line) VALUES(?,?,?,?,?,?)",
+                            (doc_id, i, head[:200], txt, s, e))
+            c.execute("INSERT INTO chunks_fts(rowid,text) VALUES(?,?)", (cur.lastrowid, txt))
+            chunks_n += 1
+        if (added + updated) % 500 == 0:
+            c.commit(); print(f"  … {added+updated} docs, {chunks_n} chunks", file=sys.stderr)
+
+    gone = [pth for pth in existing if pth not in seen]
+    for pth in gone:
+        c.execute("DELETE FROM chunks WHERE doc_id=(SELECT id FROM documents WHERE path=?)", (pth,))
+        c.execute("DELETE FROM documents WHERE path=?", (pth,))
+    c.commit()
+    c.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')"); c.commit()
+    n_docs = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    print(f"{added} new, {updated} changed, {len(gone)} removed | {n_docs} docs, {n_chunks} chunks | {time.time()-t0:.0f}s")
+
+
+def _rows(c, q, tiers, since, project, limit):
+    sql = """SELECT d.path, d.tier, d.title, d.date, ch.start_line, ch.heading, ch.text,
+                    bm25(chunks_fts) AS score
+             FROM chunks_fts JOIN chunks ch ON ch.id = chunks_fts.rowid
+             JOIN documents d ON d.id = ch.doc_id
+             WHERE chunks_fts MATCH ?"""
+    p = [q]
+    if tiers:
+        sql += f" AND d.tier IN ({','.join('?'*len(tiers))})"; p += tiers
+    if since:
+        sql += " AND d.date >= ?"; p.append(since)
+    if project:
+        sql += " AND d.id IN (SELECT doc_id FROM meta WHERE key IN ('project','tags') AND value = ?)"; p.append(project)
+    sql += " ORDER BY score LIMIT ?"; p.append(limit)
+    return c.execute(sql, p).fetchall()
+
+
+def show(rows, as_json, sweep=False):
+    if as_json:
+        for r in rows:
+            print(json.dumps({"path": r[0], "tier": r[1], "title": r[2], "date": r[3],
+                              "line": r[4], "heading": r[5], "score": r[7],
+                              "excerpt": " ".join(r[6].split())[:300]}))
+        return
+    if not rows:
+        print("no matches"); return
+    seen = set()
+    for path, tier, title, date, line, heading, text, score in rows:
+        if sweep and path in seen: continue
+        seen.add(path)
+        flag = "  ⚠ machine transcript" if tier == "transcript" else ""
+        print(f"\n{path}:{line}  [{tier}]{f'  {date[:10]}' if date else ''}{flag}")
+        if heading: print(f"  § {heading[:90]}")
+        print(f"  {' '.join(text.split())[:260]}")
+
+
+def find_cmd(a):
+    c = connect()
+    show(_rows(c, a.query, a.tier, a.since, a.project, a.limit), a.json)
+
+
+def sweep_cmd(a):
+    c = connect()
+    rows = _rows(c, a.query, a.tier, None, None, 400)
+    show(rows, a.json, sweep=True)
+    if a.frontmatter:
+        hits = c.execute("SELECT DISTINCT d.path, m.key, m.value FROM meta m JOIN documents d ON d.id=m.doc_id "
+                         "WHERE m.value LIKE ? LIMIT 100", (f"%{a.query}%",)).fetchall()
+        if hits:
+            print("\n── frontmatter properties (assert facts silently) ──")
+            for p, k, v in hits: print(f"  {p}\n    {k}: {v}")
+
+
+def links_cmd(a):
+    c = connect()
+    rows = c.execute("SELECT d.path, d.tier FROM links l JOIN documents d ON d.id=l.doc_id "
+                     "WHERE l.target LIKE ? LIMIT ?", (a.entity, a.limit)).fetchall()
+    print(f"pages linking to [[{a.entity}]]: {len(rows)}")
+    for p, t in rows: print(f"  [{t}] {p}")
+
+
+def stat_cmd(a):
+    c = connect()
+    print(f"db: {DB}  ({DB.stat().st_size/1048576:.0f}MB)" if DB.exists() else "not built")
+    for tier, n, ch in c.execute("""SELECT d.tier, COUNT(DISTINCT d.id), COUNT(ch.id)
+                                    FROM documents d LEFT JOIN chunks ch ON ch.doc_id=d.id
+                                    GROUP BY d.tier ORDER BY 3 DESC"""):
+        print(f"  {tier:12} {n:6} docs  {ch:8} chunks")
+    tot = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    tc = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    print(f"  {'TOTAL':12} {tot:6} docs  {tc:8} chunks")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="vault-search")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("index"); i.add_argument("--force", action="store_true"); i.set_defaults(fn=index_cmd)
+    f = sub.add_parser("find"); f.add_argument("query"); f.add_argument("--tier", action="append")
+    f.add_argument("--since"); f.add_argument("--project"); f.add_argument("--limit", type=int, default=10)
+    f.add_argument("--json", action="store_true"); f.set_defaults(fn=find_cmd)
+    s = sub.add_parser("sweep"); s.add_argument("query"); s.add_argument("--tier", action="append")
+    s.add_argument("--frontmatter", action="store_true"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=sweep_cmd)
+    l = sub.add_parser("links"); l.add_argument("entity"); l.add_argument("--limit", type=int, default=50)
+    l.set_defaults(fn=links_cmd)
+    st = sub.add_parser("stat"); st.set_defaults(fn=stat_cmd)
+    a = ap.parse_args(); return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
