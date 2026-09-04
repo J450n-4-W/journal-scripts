@@ -142,12 +142,55 @@ def test_outreach(oc):
     check("no Message-ID means unusable", oc.parse(b"From: x@y\r\nSubject: no id\r\n"), None)
 
 
+def test_cite_check(cc):
+    print("cite-check — provenance, not importance")
+    flag = lambda t: [s for _, s in cc.check(t)]
+    # SHOULD flag: attribution to something someone else published, no link
+    for t in ["According to a report published in March, the firm was investigated.",
+              "Smith told the New York Times that he knew nothing about the payments.",
+              "The exchange was reportedly hostile and lasted several hours in total.",
+              "Axios reported that the video had been produced externally by the firm."]:
+        check(f"flags: {t[:44]}", len(flag(t)), 1)
+    # SHOULD NOT flag: the reporter's own work, which cannot be linked
+    for t in ["Records show the transfers began in April of that year, filings confirm.",
+              "A spokesperson said in a statement that the company acted lawfully here.",
+              "According to a Guardian analysis, the group published 124 reports total.",
+              "He told the Guardian that he had no knowledge of any of the payments.",
+              "The documents were obtained by this publication earlier in the year now."]:
+        check(f"ignores own work: {t[:36]}", len(flag(t)), 0)
+    # SHOULD NOT flag: attributed AND linked
+    check("ignores a linked attribution",
+          len(flag("It was [first reported by](https://x.com/a) a trade publication today.")), 0)
+    # case: sentence-initial "According" was missed when re.I was dropped
+    check("sentence-initial According is caught",
+          len(flag("According to a filing, the company moved the funds offshore in May.")), 1)
+
+
+def test_preserve(pc):
+    print("preserve-check — URL extraction and skip rules")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write("See [a](https://example.com/x) and https://foo.org/y.\n"
+                "Skip https://web.archive.org/web/1/z and http://localhost:8080/q.\n"
+                "Trailing punctuation: https://bar.net/p).\n")
+        name = f.name
+    got = {u for _, u in pc.urls_in(name)}
+    check("markdown link extracted", "https://example.com/x" in got)
+    check("bare URL extracted", "https://foo.org/y" in got)
+    check("archive.org skipped", not any("web.archive.org" in u for u in got))
+    check("localhost skipped", not any("localhost" in u for u in got))
+    check("trailing paren stripped", "https://bar.net/p" in got)
+    pathlib.Path(name).unlink()
+
+
 def main():
     vs = load("vault-search"); pj = load("projects"); hs = load("hub-sync")
     test_chunker(vs); test_dates(vs); test_fts_query(vs)
     test_binary_guard(vs); test_frontmatter(vs)
     test_projects(pj); test_hub_sync(hs)
     test_outreach(load("outreach"))
+    test_cite_check(load("cite-check"))
+    test_preserve(load("preserve-check"))
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

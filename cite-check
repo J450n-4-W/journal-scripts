@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""cite-check — find claims attributed to a published source that carry no link.
+
+The rule is NOT "important facts need links". That question is unanswerable and was
+the reason this sat unbuilt. Sampling 74 published pieces in ~/Investigations/archive
+gave a rule that is decidable: **link on provenance, not importance.**
+
+  Linked in published copy:   claims resting on something someone else published —
+                              "according to company filings", "told the Independent",
+                              "the New York Times reported", "claims on its website".
+  Unlinked in published copy: claims resting on the reporter's OWN work — document
+                              review, interviews, records searches. Unlinkable in
+                              principle, and correctly unlinked.
+
+So the checker never judges which facts matter. It detects attribution to an external
+published source and asks whether a link sits next to it. Everything else is ignored.
+
+Precision is deliberately favoured over recall: a checker that cries wolf gets turned
+off. `--calibrate` measures the false-positive rate against already-published copy,
+where the flag rate should be near zero.
+
+Usage:
+    cite-check draft.md [draft2.md ...]
+    cite-check --calibrate            score against the published archive
+"""
+import re, sys, glob, pathlib, argparse
+
+# Attribution to something SOMEONE ELSE published. Calibration against 202 published
+# pieces drove every narrowing here — the first version flagged 55% of already-shipped
+# attributions, which is a checker nobody would leave switched on.
+OUTLETS = (r'New\s+York\s+Times|Washington\s+Post|Wall\s+Street\s+Journal|Reuters'
+           r'|Associated\s+Press|Bloomberg|Politico|Axios|BBC|CNN|NBC|CBS|ProPublica'
+           r'|Rolling\s+Stone|Wired|Vox|Daily\s+Beast|HuffPost|Newsweek|Telegraph'
+           r'|Financial\s+Times|Independent')
+
+ATTRIB = re.compile(rf'''(
+    # "according to" only when it points at a PUBLISHED artefact — not at an
+    # interview, and not at the reporter's own analysis.
+    (?i:\baccording\s+to\s+(?:a\s+|an\s+|the\s+)?
+      (?:report|study|statement|filing|filings|document|documents|press\s+release
+        |transcript|website|profile|obituary|article|investigation\s+by)\b)
+  | (?i:\baccording\s+to\s+(?:a\s+|an\s+|the\s+)?)(?:{OUTLETS})\b
+  | (?i:\breportedly\b)
+  | (?i:\bas\s+(?:first\s+)?reported\s+by\b)
+  | (?i:\bfirst\s+reported\s+by\b)
+    # An outlet name only counts inside an attribution construction. A bare mention
+    # is not a citation: "Yarvin said ..." with CBS elsewhere in the sentence is not.
+  | (?i:\btold\s+the\s+)(?:{OUTLETS})\b
+  | \b(?:{OUTLETS})\s+(?:reported|revealed|found|wrote|noted)\b
+  | (?i:\bin\s+(?:a|an|its|their)\s+(?:press\s+release|court\s+filing|SEC\s+filing
+        |annual\s+report|blog\s+post|newsletter)\b)
+)''', re.X)
+
+# The reporter's OWN work. Unlinkable in principle, and correctly unlinked in the
+# published corpus — the largest single source of false positives before this existed.
+OWN_WORK = re.compile(r'''(
+    \btold\s+(?:me|us|the\s+Guardian)\b
+  | \bin\s+an\s+interview\b
+  | \bspoke\s+to\b
+  | \bthis\s+(?:reporter|publication)\b
+  | \b(?:reviewed|obtained|seen)\s+by\b
+    # "According to a Guardian analysis" is his own analysis, not a citation.
+  | \b(?:Guardian|our|this)\s+(?:analysis|review|investigation|reporting)\b
+    # "SBA records show", "court records show" — his own records search.
+  | \b(?:records|filings|data|documents)\s+(?:show|indicate|reveal|suggest)\b
+    # "said in a statement" is almost always a reply to his own request for comment.
+  | \baccording\s+to\s+the\s+(?:documents?|records|files|transcript|recording|audio|video)\b
+  | \bsaid\s+in\s+a\s+statement\b
+  | \bin\s+a\s+statement\s+to\b
+  | \bdid\s+not\s+respond\b
+  | \bdeclined\s+to\s+comment\b
+)''', re.X | re.I)
+
+LINK = re.compile(r'\]\(\s*https?://|<https?://|\bhttps?://\S+')
+FM = re.compile(r'^---\s*\n.*?\n---\s*\n', re.S)
+SENT = re.compile(r'(?<=[.!?])\s+(?=[A-Z"“\[])')
+
+
+def sentences(text):
+    """(line_number, sentence) skipping frontmatter, code fences and block quotes."""
+    text = FM.sub("", text)
+    out, line, in_code = [], 1, False
+    for para in text.split("\n\n"):
+        n = para.count("\n") + 2
+        stripped = para.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+        if not in_code and stripped and not stripped.startswith((">", "|", "#", "```")):
+            for s in SENT.split(para):
+                s = " ".join(s.split())
+                if len(s) > 30:
+                    out.append((line, s))
+        line += n
+    return out
+
+
+def check(text):
+    flags = []
+    for line, s in sentences(text):
+        if not ATTRIB.search(s):
+            continue
+        if OWN_WORK.search(s):
+            continue                       # own reporting: unlinkable by nature
+        if LINK.search(s):
+            continue
+        flags.append((line, s))
+    return flags
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cite-check")
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="measure the false-positive rate against published copy")
+    a = ap.parse_args()
+
+    if a.calibrate:
+        arch = sorted(glob.glob(str(pathlib.Path.home()/"Investigations/archive/*.md")))
+        tot_sent = tot_attrib = tot_flag = 0
+        worst = []
+        for f in arch:
+            try: t = pathlib.Path(f).read_text(errors="ignore")
+            except Exception: continue
+            if len(t.split()) < 400: continue
+            ss = sentences(t)
+            att = [s for _, s in ss if ATTRIB.search(s) and not OWN_WORK.search(s)]
+            fl = check(t)
+            tot_sent += len(ss); tot_attrib += len(att); tot_flag += len(fl)
+            if fl: worst.append((len(fl), pathlib.Path(f).name))
+        print(f"calibration against {len(arch)} published pieces")
+        print(f"  sentences                     {tot_sent}")
+        print(f"  externally attributed         {tot_attrib}")
+        print(f"  attributed but UNLINKED       {tot_flag}"
+              f"  ({100*tot_flag/max(tot_attrib,1):.1f}% of attributed)")
+        print("\n  This residual is NOT purely false positives, and cannot be split\n"
+              "  automatically. An unlinked attribution in shipped copy is either a\n"
+              "  pattern that is still too loose, or a genuine miss — and 'reportedly'\n"
+              "  without a link is a miss by the house rule, which requires one.\n"
+              "  Read a sample before deciding which.")
+        for n, name in sorted(worst, reverse=True)[:5]:
+            print(f"    {n:3}  {name[:70]}")
+        return 0
+
+    if not a.files:
+        print("usage: cite-check draft.md [...]  |  cite-check --calibrate", file=sys.stderr)
+        return 2
+    total = 0
+    for f in a.files:
+        p = pathlib.Path(f)
+        if not p.is_file():
+            print(f"{f}: not found", file=sys.stderr); continue
+        fl = check(p.read_text(errors="ignore"))
+        total += len(fl)
+        if fl:
+            print(f"\n{f} — {len(fl)} attributed claim(s) with no link\n")
+            for line, s in fl:
+                print(f"  line {line}: {s[:150]}")
+        else:
+            print(f"{f}: no unlinked attributions")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
