@@ -252,6 +252,7 @@ HEALTH = [
     ("session-log", ("file", HOME/".local/state/daily-session-log.log"),        24),
     ("brief",       ("file", HOME/".local/state/brief.log"),                    24),
     ("index",       ("file", HOME/".local/state/vault-search.db"),              24 * 7),
+    ("outreach",    ("file", HOME/".local/state/outreach.log"),                 24),
     ("ct-watch",    ("file", HOME/"Investigations/old_stories/NDA/evidence/crtsh/watch"), 12),
     ("fara",        ("systemd", "fara-watch.timer"),                            24),
     ("congress",    ("systemd", "congress-watch.timer"),                        24),

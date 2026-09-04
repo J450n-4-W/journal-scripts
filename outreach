@@ -31,6 +31,7 @@ from email.header import decode_header, make_header
 
 HOME = pathlib.Path.home()
 DB = HOME/".local/state/outreach.db"
+LOGFILE = HOME/".local/state/outreach.log"
 SENT_GLOBS = ["~/.thunderbird/*/ImapMail/*/Sent*", "~/.thunderbird/*/Mail/*/Sent*"]
 RECV_GLOBS = ["~/.thunderbird/*/ImapMail/*/INBOX",  "~/.thunderbird/*/Mail/*/Inbox"]
 # Jason's own addresses: mail "from" these is outbound wherever it is filed.
@@ -44,6 +45,16 @@ CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, offset INTEGER, mtime 
 CREATE INDEX IF NOT EXISTS ix_msg_dir ON msg(direction, ts);
 CREATE INDEX IF NOT EXISTS ix_msg_from ON msg(from_addr);
 """
+
+
+def log(msg):
+    """Log EVERY run, not just runs that found something. The health footer reads this
+    file's mtime, and a quiet day writes no rows — so measuring the database instead
+    would make 'no new mail' indistinguishable from 'the job is dead'."""
+    import datetime
+    LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOGFILE, "a") as f:
+        f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
 
 
 def dec(s):
@@ -130,8 +141,10 @@ def index_cmd(a):
                 if n: print(f"  {os.path.basename(os.path.dirname(path))}/"
                             f"{os.path.basename(path)}: +{n}", file=sys.stderr)
                 total += n
-    s = c.execute("SELECT direction, COUNT(*) FROM msg GROUP BY direction").fetchall()
-    print(f"indexed +{total} | " + ", ".join(f"{d}: {n}" for d, n in s))
+    st_ = c.execute("SELECT direction, COUNT(*) FROM msg GROUP BY direction").fetchall()
+    msg = f"indexed +{total} | " + ", ".join(f"{d}: {n}" for d, n in st_)
+    log(msg)
+    print(msg)
     return 0
 
 
