@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""outreach — who you contacted, who replied, and who has gone quiet.
+
+The claim "contacted, no response" appears in every story page's Sources block and is
+the kind of thing that gets published. Until now nothing could verify it: sent mail
+was captured daily by sent-mail-digest and scattered across session logs by date, and
+replies were captured nowhere at all.
+
+Scope is REPLIES ONLY, deliberately. That is the one join that is exact: every sent
+message has a Message-ID, and a reply names it in References. Anything wider needs
+fuzzy address matching. Cold inbound that never gets a reply is out of scope — but
+replying to a tip pulls its whole thread in via the backward walk below, which makes
+that exclusion mostly theoretical.
+
+Two findings from the real mail store shaped this:
+  - Messages carry References far more reliably than In-Reply-To, so References is
+    the primary join and In-Reply-To the supplement, not the other way round.
+  - The INBOX mboxes total ~2.9GB. Python's mailbox module parses whole messages;
+    this streams headers only and checkpoints byte offsets, because mbox is
+    append-mostly and a full rescan every run is not viable.
+
+Usage:
+    outreach index                 scan mail, update the database
+    outreach outstanding [--days N]  sent, unanswered, oldest first
+    outreach thread <address|id>   everything exchanged with someone
+    outreach stat
+"""
+import os, re, sys, time, email, sqlite3, pathlib, argparse, mailbox
+from email.utils import parsedate_to_datetime, getaddresses
+from email.header import decode_header, make_header
+
+HOME = pathlib.Path.home()
+DB = HOME/".local/state/outreach.db"
+SENT_GLOBS = ["~/.thunderbird/*/ImapMail/*/Sent*", "~/.thunderbird/*/Mail/*/Sent*"]
+RECV_GLOBS = ["~/.thunderbird/*/ImapMail/*/INBOX",  "~/.thunderbird/*/Mail/*/Inbox"]
+# Jason's own addresses: mail "from" these is outbound wherever it is filed.
+OWN = {"jason.a.wilson@protonmail.com", "jtonywilson@protonmail.com"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS msg(
+  msgid TEXT PRIMARY KEY, direction TEXT, ts REAL, subject TEXT,
+  from_addr TEXT, to_addrs TEXT, refs TEXT, mbox TEXT);
+CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, offset INTEGER, mtime REAL);
+CREATE INDEX IF NOT EXISTS ix_msg_dir ON msg(direction, ts);
+CREATE INDEX IF NOT EXISTS ix_msg_from ON msg(from_addr);
+"""
+
+
+def dec(s):
+    try: return str(make_header(decode_header(s or "")))
+    except Exception: return s or ""
+
+
+def headers_only(path, start=0):
+    """Yield (offset, header_dict) streaming an mbox. Reads header blocks and skips
+    bodies — the mailbox module parses entire messages, which is far too slow across
+    ~2.9GB."""
+    with open(path, "rb") as f:
+        f.seek(start)
+        buf, off, in_hdr = [], start, False
+        for line in f:
+            if line.startswith(b"From ") and (not buf or not in_hdr):
+                if buf:
+                    yield off, b"".join(buf)
+                buf, off, in_hdr = [], f.tell() - len(line), True
+                continue
+            if in_hdr:
+                if line in (b"\n", b"\r\n"):
+                    yield off, b"".join(buf)
+                    buf, in_hdr = [], False
+                else:
+                    buf.append(line)
+        if buf:
+            yield off, b"".join(buf)
+
+
+def parse(raw):
+    try:
+        m = email.message_from_bytes(raw)
+    except Exception:
+        return None
+    mid = (m.get("Message-ID") or "").strip()
+    if not mid:
+        return None
+    try:
+        ts = parsedate_to_datetime(m.get("Date")).timestamp()
+    except Exception:
+        ts = 0
+    frm = [a.lower() for _, a in getaddresses([m.get("From") or ""]) if a]
+    # getaddresses takes a LIST of header values. Passing one concatenated string
+    # makes it iterate characters and silently return nothing — every one of 8,014
+    # sent messages had an empty recipient before this was caught.
+    tos = [a.lower() for _, a in getaddresses([m.get("To") or "", m.get("Cc") or ""]) if a]
+    refs = " ".join(re.findall(r'<[^>]+>',
+                   (m.get("References") or "") + " " + (m.get("In-Reply-To") or "")))
+    return dict(msgid=mid, ts=ts, subject=dec(m.get("Subject"))[:300],
+                from_addr=frm[0] if frm else "", to_addrs=",".join(tos)[:500], refs=refs)
+
+
+def index_cmd(a):
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    seen = {r[0]: (r[1], r[2]) for r in c.execute("SELECT path, offset, mtime FROM scanned")}
+    import glob
+    total = 0
+    for direction, globs in (("sent", SENT_GLOBS), ("recv", RECV_GLOBS)):
+        for g in globs:
+            for path in sorted(glob.glob(os.path.expanduser(g))):
+                if path.endswith(".msf") or "smart mailboxes" in path or not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                prev = seen.get(path, (0, 0))
+                start = prev[0] if (st.st_mtime >= prev[1] and st.st_size >= prev[0]) else 0
+                if a.full: start = 0
+                if start and st.st_size == start:
+                    continue
+                n = 0
+                for off, raw in headers_only(path, start):
+                    d = parse(raw)
+                    if not d: continue
+                    dd = direction
+                    if d["from_addr"] in OWN: dd = "sent"      # filed anywhere
+                    c.execute("INSERT OR REPLACE INTO msg VALUES(?,?,?,?,?,?,?,?)",
+                              (d["msgid"], dd, d["ts"], d["subject"], d["from_addr"],
+                               d["to_addrs"], d["refs"], path))
+                    n += 1
+                c.execute("INSERT OR REPLACE INTO scanned VALUES(?,?,?)",
+                          (path, st.st_size, st.st_mtime))
+                c.commit()
+                if n: print(f"  {os.path.basename(os.path.dirname(path))}/"
+                            f"{os.path.basename(path)}: +{n}", file=sys.stderr)
+                total += n
+    s = c.execute("SELECT direction, COUNT(*) FROM msg GROUP BY direction").fetchall()
+    print(f"indexed +{total} | " + ", ".join(f"{d}: {n}" for d, n in s))
+    return 0
+
+
+def _replies(c):
+    """{sent_msgid: (reply_ts, from_addr)} — a reply NAMES the message it answers in
+    References, so this join is exact rather than heuristic."""
+    out = {}
+    sent = {r[0] for r in c.execute("SELECT msgid FROM msg WHERE direction='sent'")}
+    for mid, ts, frm, refs in c.execute(
+            "SELECT msgid, ts, from_addr, refs FROM msg WHERE direction='recv' AND refs != ''"):
+        for r in refs.split():
+            if r in sent and (r not in out or ts < out[r][0]):
+                out[r] = (ts, frm)
+    return out
+
+
+def outstanding_cmd(a):
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    replies = _replies(c)
+    now = time.time()
+    rows = []
+    for mid, ts, subj, tos in c.execute(
+            "SELECT msgid, ts, subject, to_addrs FROM msg WHERE direction='sent' AND ts > 0 ORDER BY ts DESC"):
+        if mid in replies: continue
+        age = (now - ts) / 86400
+        if age > a.days: continue
+        # A later message in the same thread to the same person supersedes an earlier
+        # one; only the most recent unanswered contact per address is interesting.
+        rows.append((age, tos.split(",")[0] if tos else "?", subj, ts))
+    best = {}
+    for age, to, subj, ts in rows:
+        if to not in best or ts > best[to][3]:
+            best[to] = (age, to, subj, ts)
+    out = sorted(best.values(), key=lambda r: -r[0])
+    if a.json:
+        import json
+        for age, to, subj, ts in out:
+            print(json.dumps({"to": to, "days": round(age, 1), "subject": subj,
+                              "sent": time.strftime("%Y-%m-%d", time.localtime(ts))}))
+        return 0
+    if not out:
+        print("nothing outstanding"); return 0
+    print(f"{len(out)} unanswered (last {a.days}d), oldest first\n")
+    for age, to, subj, ts in out:
+        print(f"  {int(age):3}d  {to[:42]:42}  {subj[:60]}")
+    return 0
+
+
+def window_cmd(a):
+    """Everything sent between two dates, with reply status. Used at story closeout:
+    a story's outreach cannot be joined to it automatically — RoR drafts are letter
+    bodies addressed by name, with no address in them — so the honest move is to
+    surface candidates from the story's active period rather than guess a match."""
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    replies = _replies(c)
+    lo = time.mktime(time.strptime(a.since, "%Y-%m-%d"))
+    hi = time.mktime(time.strptime(a.until, "%Y-%m-%d")) + 86400
+    rows = c.execute("""SELECT msgid, ts, subject, to_addrs FROM msg
+                        WHERE direction='sent' AND ts BETWEEN ? AND ? ORDER BY ts""",
+                     (lo, hi)).fetchall()
+    seen = set()
+    for mid, ts, subj, tos in rows:
+        to = tos.split(",")[0] if tos else "?"
+        if to in seen or not to or to == "?": continue
+        seen.add(to)
+        when = time.strftime("%Y-%m-%d", time.localtime(ts))
+        if mid in replies:
+            r = time.strftime("%Y-%m-%d", time.localtime(replies[mid][0]))
+            print(f"- `{to}` — contacted {when}, **replied** {r}")
+        else:
+            print(f"- `{to}` — contacted {when}, **no reply**")
+    if not seen:
+        print("- (no outreach recorded in this window)")
+    return 0
+
+
+def thread_cmd(a):
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    q = a.who.lower()
+    rows = c.execute("""SELECT ts, direction, from_addr, to_addrs, subject FROM msg
+                        WHERE from_addr LIKE ? OR to_addrs LIKE ? ORDER BY ts""",
+                     (f"%{q}%", f"%{q}%")).fetchall()
+    if not rows:
+        print("no messages"); return 1
+    for ts, d, frm, tos, subj in rows:
+        when = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "?"
+        arrow = "->" if d == "sent" else "<-"
+        who = tos.split(",")[0] if d == "sent" else frm
+        print(f"  {when}  {arrow}  {who[:40]:40}  {subj[:60]}")
+    return 0
+
+
+def stat_cmd(a):
+    if not DB.exists():
+        print("not indexed — run `outreach index`"); return 1
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    for d, n in c.execute("SELECT direction, COUNT(*) FROM msg GROUP BY direction"):
+        print(f"  {d:6} {n}")
+    r = _replies(c)
+    sent = c.execute("SELECT COUNT(*) FROM msg WHERE direction='sent'").fetchone()[0]
+    print(f"  replies matched to a sent message: {len(r)} of {sent}")
+    print(f"  mboxes scanned: {c.execute('SELECT COUNT(*) FROM scanned').fetchone()[0]}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="outreach")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("index"); i.add_argument("--full", action="store_true",
+        help="rescan from byte 0 (default resumes from the last offset)")
+    i.set_defaults(fn=index_cmd)
+    o = sub.add_parser("outstanding"); o.add_argument("--days", type=int, default=90)
+    o.add_argument("--json", action="store_true"); o.set_defaults(fn=outstanding_cmd)
+    w = sub.add_parser("window"); w.add_argument("--since", required=True)
+    w.add_argument("--until", required=True); w.set_defaults(fn=window_cmd)
+    t = sub.add_parser("thread"); t.add_argument("who"); t.set_defaults(fn=thread_cmd)
+    s = sub.add_parser("stat"); s.set_defaults(fn=stat_cmd)
+    a = ap.parse_args(); return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

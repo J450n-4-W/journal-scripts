@@ -397,6 +397,46 @@ if [[ ${#skipped_txt[@]} -gt 0 ]]; then
     echo ""
 fi
 
+# --- outreach: what was sent during this story's active period, and who replied ---
+# The template's "Contacted (no response)" line is a claim that gets published, and
+# nothing could verify it before: RoR drafts in the story folder are letter bodies
+# addressed by name with no address in them, and the sent record lived scattered
+# across daily session logs by date.
+#
+# There is no reliable automatic join between a story and its outreach, so this does
+# NOT invent one. It reports every message sent during the story's active window with
+# its reply status, as candidates for a human to confirm. Guessing by surname would
+# be fabricating a link the data does not support.
+if command -v outreach >/dev/null 2>&1; then
+    WIN_FROM="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | head -1 | cut -d. -f1)"
+    WIN_TO="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+    if [[ -n "$WIN_FROM" && -n "$WIN_TO" ]]; then
+        FROM_D="$(date -d "@$WIN_FROM" +%Y-%m-%d)"
+        TO_D="$(date -d "@$WIN_TO" +%Y-%m-%d)"
+        OUTREACH_MD="$(outreach window --since "$FROM_D" --until "$TO_D" 2>/dev/null)"
+        if [[ -n "$OUTREACH_MD" ]]; then
+            echo "Outreach in the story's active window ($FROM_D to $TO_D):"
+            echo "$OUTREACH_MD" | head -20 | sed 's/^/  /'
+            n=$(echo "$OUTREACH_MD" | wc -l)
+            [[ "$n" -gt 20 ]] && echo "  … and $((n - 20)) more"
+            if [[ $DRY_RUN -eq 0 && -n "$STORY_PAGE" ]]; then
+                {
+                    echo ""
+                    echo "## Outreach in the working window ($FROM_D to $TO_D)"
+                    echo ""
+                    echo "Every message sent while this story was active, with reply status matched"
+                    echo "by Message-ID. **Candidates, not a verified story list** — there is no"
+                    echo "reliable automatic join between a story and its outreach. Prune by hand."
+                    echo ""
+                    echo "$OUTREACH_MD"
+                } >> "$STORY_PAGE"
+                echo "  → appended to $(basename "$STORY_PAGE")"
+            fi
+            echo ""
+        fi
+    fi
+fi
+
 # --- story page: mark published, record where the media went ---
 # Matched on resolved story_dir, never on page title: frontmatter slugs and on-disk
 # directory names diverge freely (Jace_Yarbrough vs yarbrough, aief-trips vs

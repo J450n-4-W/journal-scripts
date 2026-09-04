@@ -117,10 +117,28 @@ def candidates(state=None):
     slipping = [r for r in recs
                 if r.derived_status != "published" and r.outstanding() > 0
                 and (r.days_quiet or 0) >= SLIPPING_DAYS]
+    # An unanswered request for comment is the definition of a slipping thread, and
+    # until now nothing could see one: sent mail was scattered across daily logs and
+    # replies were captured nowhere. It competes with project neglect for this slot.
+    ror = None
+    ror_out, rc = sh(["outreach", "outstanding", "--days", "120", "--json"])
+    if rc == 0 and ror_out:
+        try:
+            items = [json.loads(l) for l in ror_out.splitlines() if l.strip().startswith("{")]
+            items = [i for i in items if i.get("days", 0) >= SLIPPING_DAYS]
+            if items:
+                ror = max(items, key=lambda i: i["days"])
+        except Exception:
+            pass
     slipping = [r for r in slipping if alive(f"slip:{r.name}")]
     slipping.sort(key=lambda r: r.days_quiet or 0, reverse=True)
-    if slipping:
-        r = slipping[0]
+    top_project = slipping[0] if slipping else None
+    if ror and (not top_project or ror["days"] > (top_project.days_quiet or 0)):
+        if alive(f"ror:{ror['to']}"):
+            out.append(("slipping", f"ror:{ror['to']}",
+                        f"**{ror['to']}** — no reply in {int(ror['days'])}d: {ror['subject'][:60]}"))
+    elif top_project:
+        r = top_project
         out.append(("slipping", f"slip:{r.name}",
                     f"**{r.name}** slipping — quiet {r.days_quiet}d with {r.outstanding()} outstanding"))
 

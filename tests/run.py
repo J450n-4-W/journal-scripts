@@ -125,11 +125,29 @@ def test_hub_sync(hs):
         check("well-formed skill not flagged", "good" not in d)
 
 
+def test_outreach(oc):
+    print("outreach — getaddresses takes a LIST; a string iterates characters")
+    raw = (b"Message-ID: <abc@x>\r\nDate: Wed, 3 Sep 2026 10:41:00 +0100\r\n"
+           b"From: Jason <jason.a.wilson@protonmail.com>\r\n"
+           b"To: Someone <a@b.com>, Other <c@d.com>\r\nCc: Third <e@f.com>\r\n"
+           b"Subject: Request for comment\r\nReferences: <prev@y>\r\n")
+    d = oc.parse(raw)
+    check("message parsed", d is not None)
+    check("recipients extracted (was empty for all 8,014 sent)",
+          d and d["to_addrs"], cmp=lambda v: "a@b.com" in v and "c@d.com" in v)
+    check("cc included", d and d["to_addrs"], cmp=lambda v: "e@f.com" in v)
+    check("sender extracted", d and d["from_addr"], "jason.a.wilson@protonmail.com")
+    check("references captured for the reply join", d and d["refs"], "<prev@y>")
+    check("subject decoded", d and d["subject"], "Request for comment")
+    check("no Message-ID means unusable", oc.parse(b"From: x@y\r\nSubject: no id\r\n"), None)
+
+
 def main():
     vs = load("vault-search"); pj = load("projects"); hs = load("hub-sync")
     test_chunker(vs); test_dates(vs); test_fts_query(vs)
     test_binary_guard(vs); test_frontmatter(vs)
     test_projects(pj); test_hub_sync(hs)
+    test_outreach(load("outreach"))
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
