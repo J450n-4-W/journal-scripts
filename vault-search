@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS documents(
   mtime REAL, hash TEXT, title TEXT, date TEXT, indexed_at REAL);
 CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id INTEGER, ord INTEGER, heading TEXT,
-  text TEXT, start_line INTEGER, end_line INTEGER,
+  text TEXT, thash TEXT, start_line INTEGER, end_line INTEGER,
   FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS meta(doc_id INTEGER, key TEXT, value TEXT);
 CREATE TABLE IF NOT EXISTS links(doc_id INTEGER, target TEXT);
@@ -213,13 +213,57 @@ CREATE INDEX IF NOT EXISTS ix_meta_kv ON meta(key, value);
 CREATE INDEX IF NOT EXISTS ix_links_t ON links(target);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   text, content='chunks', content_rowid='id', tokenize='porter unicode61');
+-- Titles are searched separately: a person's own page often never repeats their
+-- name in the body ("she said..."), so `find "Jane Doe"` missed it entirely.
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+  title, content='documents', content_rowid='id', tokenize='porter unicode61');
 """
+
+
+def migrate(c):
+    """Additive migrations only. A full rebuild would renumber chunk ids and thereby
+    invalidate every embedding — 157k chunks and ~2.5 hours of CPU. Preserve them."""
+    cols = {r[1] for r in c.execute("PRAGMA table_info(chunks)")}
+    if cols and "thash" not in cols:
+        c.execute("ALTER TABLE chunks ADD COLUMN thash TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_chunks_thash ON chunks(thash)")
+        rows = c.execute("SELECT id, text FROM chunks").fetchall()
+        c.executemany("UPDATE chunks SET thash=? WHERE id=?",
+                      [(hashlib.sha256(" ".join(t.split()).lower().encode()).hexdigest()[:16], i)
+                       for i, t in rows])
+        print(f"  migrated: content hashes for {len(rows)} chunks", file=sys.stderr)
+    # COUNT(*) on an external-content FTS table reads the CONTENT table, not the
+    # index — so it reported 13,041 rows while the index was empty and the rebuild
+    # was skipped. Probe with an actual MATCH instead.
+    try:
+        probe = c.execute("SELECT rowid FROM docs_fts WHERE docs_fts MATCH ? LIMIT 1",
+                          ('"' + (c.execute("SELECT title FROM documents WHERE title != '' LIMIT 1")
+                                   .fetchone() or [""])[0].split()[0].replace('"', "") + '"',)).fetchone()
+        if probe is None:
+            raise sqlite3.OperationalError("empty")
+    except Exception:
+        try:
+            c.execute("INSERT INTO docs_fts(docs_fts) VALUES('rebuild')")
+            print("  migrated: title index built", file=sys.stderr)
+        except sqlite3.OperationalError:
+            pass
+    # Dates were stored verbatim, so --since silently excluded any non-ISO format.
+    bad = c.execute("SELECT id, date FROM documents WHERE date != '' AND date NOT GLOB "
+                    "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'").fetchall()
+    if bad:
+        c.executemany("UPDATE documents SET date=? WHERE id=?",
+                      [(norm_date(d), i) for i, d in bad])
+        print(f"  migrated: normalised {len(bad)} non-ISO dates", file=sys.stderr)
+    c.commit()
 
 
 def connect(vec=False):
     DB.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
+    migrate(c)
+    # After migrate, the column exists on both fresh and upgraded databases.
+    c.execute("CREATE INDEX IF NOT EXISTS ix_chunks_thash ON chunks(thash)")
     if vec and load_vec(c):
         c.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0("
                   f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBED_DIM}])")
@@ -359,6 +403,31 @@ def drop_vectors(c, doc_id):
         pass          # vector table absent; nothing to clean
 
 
+DATE_RE = [
+    (re.compile(r'^(\d{4})-(\d{2})-(\d{2})'),                     lambda m: f"{m[1]}-{m[2]}-{m[3]}"),
+    (re.compile(r'^(\d{2})/(\d{2})/(\d{4})'),                     lambda m: f"{m[3]}-{m[2]}-{m[1]}"),
+    (re.compile(r'^([A-Z][a-z]{2})\w*\s+(\d{1,2}),?\s+(\d{4})'), None),
+]
+MONTHS = {m: f"{i:02d}" for i, m in enumerate(
+    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
+
+
+def norm_date(v):
+    """--since compared raw strings, so 'Sep 3, 2026' and '03/09/2026' were silently
+    excluded by any ISO cutoff. Normalise at index time instead."""
+    v = str(v or "").strip().strip('"\'')
+    if not v or v.lower() in ("null", "none", "~") or v.startswith("{{"):
+        return ""                      # unfilled template placeholders and YAML nulls
+    v = v.replace("_", "-")            # journal filenames use 2026_09_04
+    for rx, fn in DATE_RE:
+        m = rx.match(v)
+        if not m: continue
+        if fn: return fn(m)
+        mon = MONTHS.get(m[1][:3])
+        if mon: return f"{m[3]}-{mon}-{int(m[2]):02d}"
+    return v[:10]
+
+
 def index_cmd(args):
     man = load_manifest()
     c = connect(vec=True)
@@ -385,8 +454,8 @@ def index_cmd(args):
         fm = parse_frontmatter(fm_raw)
         title = fm.get("title") or p.stem
         if isinstance(title, list): title = title[0] if title else p.stem
-        date = fm.get("date") or fm.get("published_date") or fm.get("saved_date") or ""
-        if isinstance(date, list): date = date[0] if date else ""
+        date = norm_date(fm.get("date") or fm.get("published_date") or fm.get("saved_date") or "")
+        if isinstance(date, list): date = norm_date(date[0]) if date else ""
 
         if prev:
             drop_vectors(c, prev[1])
@@ -422,8 +491,9 @@ def index_cmd(args):
             card = (str(title) + "\n" + "\n".join(vals)).strip()
             if card: pieces = [("", card, 1, 1)]
         for i, (head, txt, s, e) in enumerate(pieces):
-            cur = c.execute("INSERT INTO chunks(doc_id,ord,heading,text,start_line,end_line) VALUES(?,?,?,?,?,?)",
-                            (doc_id, i, head[:200], txt, s, e))
+            th = hashlib.sha256(" ".join(txt.split()).lower().encode()).hexdigest()[:16]
+            cur = c.execute("INSERT INTO chunks(doc_id,ord,heading,text,thash,start_line,end_line) VALUES(?,?,?,?,?,?,?)",
+                            (doc_id, i, head[:200], txt, th, s, e))
             c.execute("INSERT INTO chunks_fts(rowid,text) VALUES(?,?)", (cur.lastrowid, txt))
             chunks_n += 1
         if (added + updated) % 500 == 0:
@@ -436,7 +506,8 @@ def index_cmd(args):
         c.execute("DELETE FROM chunks WHERE doc_id=(SELECT id FROM documents WHERE path=?)", (pth,))
         c.execute("DELETE FROM documents WHERE path=?", (pth,))
     c.commit()
-    c.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')"); c.commit()
+    c.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    c.execute("INSERT INTO docs_fts(docs_fts) VALUES('rebuild')"); c.commit()
     n_docs = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     print(f"{added} new, {updated} changed, {len(gone)} removed | {n_docs} docs, {n_chunks} chunks | {time.time()-t0:.0f}s")
@@ -465,7 +536,55 @@ def _rows(c, q, tiers, since, project, limit):
     if project:
         sql += " AND d.id IN (SELECT doc_id FROM meta WHERE key IN ('project','tags') AND value = ?)"; p.append(project)
     sql += " ORDER BY score LIMIT ?"; p.append(limit)
-    return c.execute(sql, p).fetchall()
+    rows = c.execute(sql, p).fetchall()
+    # A page whose body never repeats its own subject ("she said…") is invisible to a
+    # body-only index. Search titles too and fold the hits in.
+    try:
+        # Same 8-column shape as the body query: (path, tier, title, date, line,
+        # heading, text, score). A title hit outranks body hits, hence the low score.
+        tsql = """SELECT d.path, d.tier, d.title, d.date, ch.start_line, ch.heading,
+                         ch.text, -20.0
+                  FROM docs_fts JOIN documents d ON d.id = docs_fts.rowid
+                  JOIN chunks ch ON ch.doc_id = d.id AND ch.ord = 0
+                  WHERE docs_fts MATCH ?"""
+        tp = [q]
+        if tiers:
+            tsql += f" AND d.tier IN ({','.join('?'*len(tiers))})"; tp += tiers
+        tsql += " LIMIT ?"; tp.append(max(10, limit // 2))
+        have = {(r[0], r[4]) for r in rows}
+        rows = [r for r in c.execute(tsql, tp) if (r[0], r[4]) not in have] + list(rows)
+    except sqlite3.OperationalError:
+        pass
+    return rows
+
+
+def collapse_dupes(c, rows):
+    """The same article can exist as a Reader export, a saved clip and a copy inside a
+    story folder. A sweep returning it three times looks like noise and hides real
+    breadth. Collapse on exact normalised-content hash, keep the most-curated path,
+    and say how many other copies exist rather than hiding them."""
+    if not rows: return rows, 0
+    ids = [r[0] for r in rows]
+    hashes = {}
+    for i in range(0, len(ids), 900):
+        blk = ids[i:i+900]
+        for cid, th in c.execute(
+                f"SELECT id, thash FROM chunks WHERE id IN ({','.join('?'*len(blk))})", blk):
+            hashes[cid] = th
+    TIER_RANK = {"own": 0, "source": 1, "notes": 2, "external": 3, "transcript": 4}
+    best, extra = {}, 0
+    for r in rows:
+        th = hashes.get(r[0])
+        if not th:
+            best[("id", r[0])] = r; continue
+        prev = best.get(th)
+        if prev is None:
+            best[th] = r
+        else:
+            extra += 1
+            if TIER_RANK.get(r[2], 9) < TIER_RANK.get(prev[2], 9):
+                best[th] = r
+    return list(best.values()), extra
 
 
 def show(rows, as_json, sweep=False):
@@ -522,19 +641,56 @@ def find_cmd(a):
     show(ranked[:a.limit], a.json)
 
 
+SWEEP_SHOW = 200
+
+
 def sweep_cmd(a):
     """Recall, not precision. Vector recall is on by default here because the
     corrections protocol exists to catch the same claim phrased differently, which
-    is exactly what lexical search cannot do."""
+    is exactly what lexical search cannot do.
+
+    The lexical half is EXHAUSTIVE: one best chunk per document, no row limit, so
+    the file count is the real number of matching files. Previously this took the
+    top-400 chunks by bm25 and deduped afterwards, which reported a truncated subset
+    as though it were complete — the worst possible failure for a corrections sweep,
+    where a missed occurrence is the entire cost."""
     c = connect(vec=not a.no_semantic)
-    rows = list(_rows(c, fts_query(a.query, getattr(a, 'raw', False)), a.tier, None, None, 400))
+    q = fts_query(a.query, getattr(a, 'raw', False))
+    # No bm25 here, deliberately. A sweep is not a ranked list — it is "every file
+    # this claim appears in", and ranking it invites the truncation that made the old
+    # implementation dishonest. FTS5 also refuses bm25() outside a direct query
+    # context, so avoiding it removes a constraint as well as a temptation.
+    sql = """SELECT MIN(ch.id), d.path, d.tier, d.title, d.date, MIN(ch.start_line),
+                    ch.heading, ch.text, 0.0
+             FROM chunks_fts JOIN chunks ch ON ch.id = chunks_fts.rowid
+             JOIN documents d ON d.id = ch.doc_id
+             WHERE chunks_fts MATCH ?"""
+    p = [q]
+    if a.tier:
+        sql += f" AND d.tier IN ({','.join('?'*len(a.tier))})"; p += a.tier
+    sql += " GROUP BY d.id ORDER BY d.tier, d.path"
+    rows = list(c.execute(sql, p))
     if not a.no_semantic:
         have = {(r[0], r[4]) for r in rows}
         vrows = _rows_by_ids(c, vector_ids(c, a.query, k=300), a.tier)
         for row in vrows.values():
             if (row[0], row[4]) not in have:
                 rows.append((row[0], row[1], row[2], row[3], row[4], row[5], row[6], 0.0))
-    show(rows, a.json, sweep=True)
+    rows, dupes = collapse_dupes(c, rows)
+    # collapse_dupes needs the chunk id (col 0); show() takes the 8-column shape.
+    rows = [r[1:] if len(r) == 9 else r for r in rows]
+    total = len(rows)
+    shown = rows[:SWEEP_SHOW]
+    show(shown, a.json, sweep=True)
+    if total > len(shown) and not a.json:
+        # Announce truncation. Silently showing a subset is what made the old sweep
+        # dishonest rather than merely limited.
+        print(f"\n── {total} files matched; showing {len(shown)}"
+              + (f" ({dupes} duplicates collapsed)" if dupes else "")
+              + ". Narrow with --tier, or add terms.")
+    elif not a.json:
+        print(f"\n── {total} file(s) matched (exhaustive)"
+              + (f"; {dupes} duplicate cop{'y' if dupes == 1 else 'ies'} collapsed." if dupes else "."))
     if a.frontmatter:
         hits = c.execute("SELECT DISTINCT d.path, m.key, m.value FROM meta m JOIN documents d ON d.id=m.doc_id "
                          "WHERE m.value LIKE ? LIMIT 100", (f"%{a.query}%",)).fetchall()

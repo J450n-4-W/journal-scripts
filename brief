@@ -15,12 +15,12 @@ Usage:
     brief dismiss KEY    silence an item for the cooldown period
     brief --rollup       weekly aged-out report
 """
-import os, re, sys, json, pathlib, datetime, subprocess
+import os, re, sys, json, time, pathlib, datetime, subprocess
 
 HOME = pathlib.Path.home()
 JOURNALS = HOME/"notebook/journals"
 STAGING = HOME/"notebook-staging"
-LIFE = HOME/"notebook/life"
+LIFE = HOME/"Life"
 STATE = HOME/".local/state/brief-state.json"
 LOGFILE = HOME/".local/state/brief.log"
 INVEST = (HOME/"Investigations").resolve()
@@ -157,10 +157,27 @@ def candidates(state=None):
         out.append(("maintenance", "maint:" + kind, "; ".join(maint[:2])))
 
     if LIFE.is_dir():
-        items = [f for f in sorted(LIFE.glob("*.md")) if alive(f"life:{f.stem}")]
+        # Entries here are PROJECT DIRECTORIES (Bruny, Monty), not notes. "Oldest"
+        # means the one whose newest file is furthest back — i.e. least recently
+        # touched — which is the same neglect signal slot 3 uses for reporting work.
+        items = []
+        for d in sorted(LIFE.iterdir()):
+            if d.name.startswith(".") or not alive(f"life:{d.name}"):
+                continue
+            try:
+                if d.is_dir():
+                    newest = max((f.stat().st_mtime for f in d.rglob("*") if f.is_file()), default=0)
+                else:
+                    newest = d.stat().st_mtime
+            except Exception:
+                newest = 0
+            if newest:
+                items.append((newest, d))
         if items:
-            oldest = min(items, key=lambda p: p.stat().st_mtime)
-            out.append(("life", f"life:{oldest.stem}", f"**{oldest.stem}**"))
+            newest, d = min(items)
+            quiet = int((time.time() - newest) / 86400)
+            out.append(("life", f"life:{d.name}",
+                        f"**{d.name}** — untouched {quiet}d"))
     return out
 
 
@@ -187,6 +204,7 @@ def render(state, record=True, cands=None):
             e["last"] = TODAY.isoformat()
             if e["count"] == AGE_OUT_AFTER:
                 state["aged_out"].append({"key": key, "on": TODAY.isoformat()})
+                state["aged_out"] = state["aged_out"][-200:]   # bounded
         # An item that stopped being a candidate has cleared — forget it, so a
         # recurrence starts a fresh count rather than ageing out immediately.
         live = {k for _, k, _ in candidates()}   # unfiltered: what is *actually* a
@@ -303,16 +321,30 @@ def main():
     if args and args[0] == "dismiss":
         if len(args) < 2: print("brief dismiss KEY", file=sys.stderr); return 2
         s = load_state()
-        s["dismissed"][args[1]] = (TODAY + datetime.timedelta(days=COOLDOWN_DAYS)).isoformat()
-        save_state(s); print(f"dismissed {args[1]} until {s['dismissed'][args[1]]}"); return 0
+        # Accept a unique prefix: the full keys are long enough to be unusable by hand.
+        want = args[1]
+        keys = [k for _, k, _ in candidates(s)]
+        matches = [k for k in keys if k == want] or [k for k in keys if k.startswith(want)]
+        if len(matches) > 1:
+            print("ambiguous prefix; matches:", file=sys.stderr)
+            for m in matches: print(f"  {m}", file=sys.stderr)
+            return 2
+        key = matches[0] if matches else want
+        s["dismissed"][key] = (TODAY + datetime.timedelta(days=COOLDOWN_DAYS)).isoformat()
+        save_state(s); print(f"dismissed {key} until {s['dismissed'][key]}"); return 0
     if "--rollup" in args:
         s = load_state()
         if not s.get("aged_out"): print("nothing has aged out"); return 0
         for a in s["aged_out"][-20:]: print(f"{a['on']}  {a['key']}")
         return 0
-    if "--show" in args or "--dry-run" in args:
-        lines, _ = render(load_state(), record=False)
-        print(block(lines)); return 0
+    if "--show" in args or "--dry-run" in args:      # identical: read-only preview
+        st = load_state()
+        lines, _ = render(st, record=False)
+        print(block(lines))
+        print("\nkeys (for `brief dismiss`):", file=sys.stderr)
+        for _, k, _ in candidates(st):
+            print(f"  {k}", file=sys.stderr)
+        return 0
     s = load_state()
     lines, surfaced = render(s, record=True)
     note, changed = write_note(block(lines))

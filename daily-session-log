@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# daily-session-log — fire an end-of-day session log if there was meaningful
+# activity today. Cron-triggered at 23:30 Mon–Fri; see `crontab -l`.
+#
+# Activity gate: only invokes Claude Code if today's Claude Code transcripts
+# show modifications. On idle days the script exits silently (no API call).
+#
+# When it does fire, it invokes `claude -p` in non-interactive mode with a
+# self-contained prompt that reads today's transcripts, checks git/file
+# activity in ~/notebook and ~/Chum, and writes a handoff-quality session
+# log to ~/notebook/ai-sessions/ following the convention in ~/.claude/CLAUDE.md.
+# If today's work was trivial the agent is told to skip.
+#
+# Its own activity is appended to ~/.local/state/daily-session-log.log
+# so you can `tail` it to debug.
+
+set -euo pipefail
+
+# Cron has a minimal PATH; set one that finds claude, jq, git, etc.
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# ─── configuration ────────────────────────────────────────────────────────────
+LOG_DIR="$HOME/.local/state"
+LOG_FILE="$LOG_DIR/daily-session-log.log"
+TRANSCRIPT_ROOT="$HOME/.claude/projects"   # ONE DIRECTORY PER WORKING DIRECTORY:
+                                           # -home-jason, -home-jason-Chum, ... Search all.
+TODAY="$(date +%Y-%m-%d)"
+SENT_DIGEST="$LOG_DIR/sent-digest-$TODAY.txt"
+TAG_HINT_FILE="$LOG_DIR/session-tag-$TODAY"
+CORRECTIONS_FILE="$LOG_DIR/corrections.jsonl"
+
+mkdir -p "$LOG_DIR"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+log "fired"
+
+# ─── activity gate ────────────────────────────────────────────────────────────
+# Look for transcripts modified today. If none, exit silently — no logging
+# needed, no API call.
+if [[ -d "$TRANSCRIPT_ROOT" ]]; then
+  TRANSCRIPTS_TODAY=$(find "$TRANSCRIPT_ROOT" -name "*.jsonl" -newermt "$TODAY" -type f 2>/dev/null | wc -l)
+else
+  log "transcript root $TRANSCRIPT_ROOT missing; treating as 0 transcripts"
+  TRANSCRIPTS_TODAY=0
+fi
+
+# Today's sent mail (outreach record) — write a digest the agent will read.
+SENT_TODAY=0
+if command -v sent-mail-digest >/dev/null 2>&1; then
+  if sent-mail-digest "$TODAY" > "$SENT_DIGEST" 2>>"$LOG_FILE"; then
+    SENT_TODAY=$(sed -n '1s/.*(\([0-9]\{1,\}\) message.*/\1/p' "$SENT_DIGEST")
+    SENT_TODAY=${SENT_TODAY:-0}
+  else
+    log "sent-mail-digest failed; continuing without sent-mail record"
+    : > "$SENT_DIGEST"
+  fi
+else
+  log "sent-mail-digest not found; continuing without sent-mail record"
+  : > "$SENT_DIGEST"
+fi
+
+# Activity gate: skip only if BOTH transcripts and sent mail are absent today.
+if [[ "$TRANSCRIPTS_TODAY" -eq 0 && "$SENT_TODAY" -eq 0 ]]; then
+  log "no transcripts and no sent mail today; skipping"
+  exit 0
+fi
+
+log "$TRANSCRIPTS_TODAY transcript file(s) + $SENT_TODAY sent email(s) today; invoking claude"
+
+# Baseline for the post-run validation pass.
+# Guarantee a trailing newline. Without one the agent's append glues onto the last
+# record and the validator loses both lines.
+if [[ -s "$CORRECTIONS_FILE" && -n "$(tail -c1 "$CORRECTIONS_FILE")" ]]; then
+  echo >> "$CORRECTIONS_FILE"
+fi
+CORRECTIONS_BEFORE=0
+[[ -f "$CORRECTIONS_FILE" ]] && CORRECTIONS_BEFORE=$(wc -l < "$CORRECTIONS_FILE")
+
+# ─── project tag ──────────────────────────────────────────────────────────────
+# A declared tag beats an inferred one. If ~/.local/state/session-tag-YYYY-MM-DD
+# exists, its contents are used verbatim; otherwise the agent is told to reuse an
+# existing tag rather than coin a near-duplicate (the CLAUDE.md rule that nothing
+# previously enforced).
+if [[ -f "$TAG_HINT_FILE" ]]; then
+  PROJECT_TAG="$(tr -d '\r\n' < "$TAG_HINT_FILE")"
+  log "project tag declared: $PROJECT_TAG"
+  TAG_INSTRUCTION="The project tag for today has been set explicitly. Use exactly this, verbatim, and do not infer your own: project: [${PROJECT_TAG}]"
+else
+  TAG_INSTRUCTION="Reuse an existing project tag wherever one fits — check \`grep -h '^project:' ~/notebook/ai-sessions/*.md | sort -u\` first — rather than coining a near-duplicate. Prefer one or two established tags over a long compound list."
+fi
+
+# ─── invoke claude in headless mode ───────────────────────────────────────────
+PROMPT=$(cat <<PROMPT_EOF
+You are running as an unattended end-of-day session-logger triggered by cron at 23:30 local time. Today is ${TODAY}.
+
+Your job: produce a handoff-quality session log of today's work, following the convention in ~/.claude/CLAUDE.md.
+
+Process:
+
+1. List today's Claude Code transcripts:
+   find ~/.claude/projects -name "*.jsonl" -newermt ${TODAY} -type f
+
+   NOTE: there is one directory per working directory (-home-jason, -home-jason-Chum,
+   and so on). Search them ALL. RTNN work done from ~/Chum lives in its own directory
+   and was previously invisible to this job, so those days logged as "no transcripts".
+
+   These are JSONL files, one message per line, and can be large. Use jq to
+   extract the substantive content (user messages + assistant text, skipping
+   tool calls/results) so you don't blow context. Sample multiple transcripts
+   if today had several sessions.
+
+2. Check what changed today in ~/Chum and ~/notebook:
+   - git -C ~/notebook status --porcelain  (if it's a git repo)
+   - git -C ~/Chum status --porcelain  (if it's a git repo)
+   - find ~/Chum ~/notebook -mtime -1 -type f -not -path '*/.git/*' 2>/dev/null
+
+   Also read today's OUTREACH: a digest of every email you sent today —
+   recipients, the exact address used, subjects, and full text — is at
+   ${SENT_DIGEST} (it may be empty). This is a primary record of source
+   contacts and requests for comment, and is as important to capture as the
+   transcripts.
+
+3. CAPTURE CORRECTIONS. Do this BEFORE deciding whether to write a log, and
+   do it whether or not you end up writing one. A day can be too routine to
+   log and still contain a correction worth keeping. Do it for every kind of
+   session — tooling and reporting days both produce corrections.
+
+   From today's transcripts, identify each instance where: a claim was
+   asserted and later found wrong; a claim could not be verified; or a
+   sourcing trap was discovered. For each one, append a single line of JSON
+   to ${CORRECTIONS_FILE} with exactly these keys:
+
+     id             string  "${TODAY}-01", "${TODAY}-02", ... If the file already has
+                            records for today, CONTINUE the sequence instead of
+                            restarting at 01 (check: tail -1 ${CORRECTIONS_FILE})
+     date           string  "${TODAY}"
+     project        string  the project tag for today
+     claim_wrong    string  what was asserted
+     claim_right    string  what it should have been
+     source_settled string  URL or file path that resolved it; "" if unresolved
+     surface        string  file path where the wrong claim appeared, or "chat"
+     origin         string  one of: model-fabrication, stale-source,
+                            tool-behaviour, misread-document,
+                            transcription-artefact, search-snippet, other
+     generalisable  boolean whether this is a trap that should become a rule
+     resolved       boolean false for "could not be verified" entries
+     context        string  what was being worked on when it happened
+     trigger        string  the question or task that produced the wrong claim,
+                            in enough detail to re-pose it later
+
+   Rules, which matter more than coverage:
+   - If nothing was corrected today, append NOTHING. Do not write an empty
+     record or a placeholder. A set contaminated with invented cases is worse
+     than a small one.
+   - Never invent a value to fill a field. Leave a string empty if unknown.
+   - Append only. Never rewrite or delete existing lines in that file.
+   - One JSON object per line, no pretty-printing, no wrapping array.
+
+4. Decide whether today merits a log. The CLAUDE.md rule: "For routine
+   sessions with nothing worth recording, say so and I'll skip it." If today
+   was trivial, exit and write nothing. Print one line of stdout explaining
+   why ("Skipped: routine maintenance only" or similar). Note: if you sent
+   any requests for comment or source emails today (see the outreach digest),
+   that counts as substantive — log it; do not skip.
+
+5. If today has substantive work, write a session log at
+   ~/notebook/ai-sessions/${TODAY}-<short-kebab-slug>.md
+   using the frontmatter template in ~/.claude/CLAUDE.md (date, project,
+   type: session-log, summary).
+
+   ${TAG_INSTRUCTION}
+
+   Before writing, run:
+   find ~/notebook -name "${TODAY}-*.md"
+   to check for basename collisions and pick a non-colliding slug.
+
+6. Body must be handoff-quality — a future LLM should be able to pick up the
+   thread without re-reading source material. For reporting sessions
+   (RTNN/Motor1/BoardingArea/Guardian) include: story logic, source map,
+   draft state, fact-checking catches, file inventory, open threads. For
+   code/tooling sessions include: architecture decisions, what works, what's
+   broken, next implementation step, gotchas. Be concrete with file paths.
+   For ANY day with outreach, the log MUST include an "Outreach sent today"
+   subsection built from the digest at ${SENT_DIGEST}: for each email, record
+   the recipient name, the exact address used, the subject, and a faithful
+   summary with any key lines quoted, plus any bounces/forwards. This is the
+   contact-and-text record — keep it accurate and complete. Label each item by
+   the sending persona, which the digest gives in the From: field — Guardian
+   (jason.a.wilson@protonmail.com) vs JT Wilson / RTNN-Motor1
+   (JTonyWilson@protonmail.com) — so the two are clearly distinguished even
+   though they share one log.
+
+7. Print one line of stdout summarising the outcome:
+   "Wrote ~/notebook/ai-sessions/<filename>" or "Skipped: <reason>".
+
+Do not ask follow-up questions. This is unattended.
+PROMPT_EOF
+)
+
+# --dangerously-skip-permissions because cron is unattended and the agent's
+# scope is fixed by the prompt. Output (the agent's final stdout line) is
+# captured and appended to the log file.
+if OUTPUT=$(claude --dangerously-skip-permissions -p "$PROMPT" 2>&1); then
+  log "claude exited 0; output: $OUTPUT"
+  CLAUDE_RC=0
+else
+  CLAUDE_RC=$?
+  log "claude exited $CLAUDE_RC; output: $OUTPUT"
+fi
+
+# ─── validate captured corrections ────────────────────────────────────────────
+# Any line the agent appended that is not valid JSON is logged in full and then
+# dropped, so corrections.jsonl stays parseable by construction and nothing is
+# lost. Validation never fails the run.
+if [[ -f "$CORRECTIONS_FILE" ]]; then
+  CORRECTIONS_AFTER=$(wc -l < "$CORRECTIONS_FILE")
+  ADDED=$(( CORRECTIONS_AFTER - CORRECTIONS_BEFORE ))
+  if (( ADDED > 0 )); then
+    if command -v jq >/dev/null 2>&1; then
+      VALID=0; BAD=0
+      TMP="$(mktemp)"
+      head -n "$CORRECTIONS_BEFORE" "$CORRECTIONS_FILE" > "$TMP"
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "${line// /}" ]] && continue
+        if jq -e . >/dev/null 2>&1 <<<"$line"; then
+          # Out-of-enum origin is a taxonomy slip, not a bad record — warn, keep.
+          # Dropping would lose a real correction over a metadata field.
+          ORIGIN="$(jq -r '.origin // ""' <<<"$line" 2>/dev/null || true)"
+          case "$ORIGIN" in
+            model-fabrication|stale-source|tool-behaviour|misread-document|transcription-artefact|search-snippet|other) ;;
+            *) log "correction record has out-of-enum origin '$ORIGIN' (kept): $line" ;;
+          esac
+          printf '%s\n' "$line" >> "$TMP"; VALID=$((VALID+1))
+        else
+          BAD=$((BAD+1)); log "DROPPED malformed correction record: $line"
+        fi
+      done < <(tail -n +"$((CORRECTIONS_BEFORE + 1))" "$CORRECTIONS_FILE")
+      if (( BAD > 0 )); then mv "$TMP" "$CORRECTIONS_FILE"; else rm -f "$TMP"; fi
+      log "corrections: $VALID captured, $BAD dropped (file total $(wc -l < "$CORRECTIONS_FILE"))"
+    else
+      log "jq not found; skipped validation of $ADDED appended correction line(s)"
+    fi
+  else
+    log "corrections: none captured today"
+  fi
+else
+  log "corrections: none captured today (no file)"
+fi
+
+exit $CLAUDE_RC
