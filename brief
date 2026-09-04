@@ -200,19 +200,44 @@ def render(state, record=True, cands=None):
     return lines, surfaced
 
 
-# (label, newest-mtime source, expected cadence in hours). A job whose artefact is
-# older than 2x its cadence is stale; one with no artefact at all has never run.
+# Health entries are one of two kinds:
+#   ("systemd", unit)  — ask systemd when the unit LAST RAN. Authoritative.
+#   ("file", path)     — mtime of a file or newest file in a directory.
+#
+# Prefer systemd. A monitor that runs and finds nothing often writes nothing, so an
+# output directory's mtime measures "last time there was something to report", not
+# "last time the job ran" — and a quiet week is then indistinguishable from a dead
+# timer. That is the same proxy substitution this footer exists to catch, so it
+# should not be built on one.
 HEALTH = [
-    ("session-log",  HOME/".local/state/daily-session-log.log",        24),
-    ("brief",        HOME/".local/state/brief.log",                    24),
-    ("index",        HOME/".local/state/vault-search.db",              24 * 7),
-    ("ct-watch",     HOME/"Investigations/old_stories/NDA/evidence/crtsh/watch", 12),
-    ("fara-watch",   HOME/"notebook/fara-watch",                       24),
-    ("congress-watch", HOME/"notebook/congress-watch",                 24),
-    ("donor-watch",  HOME/"notebook/donor-watch",                      24 * 7),
-    ("gift-travel",  HOME/"notebook/gift-travel-watch",                24 * 7),
-    ("backup",       pathlib.Path("/mnt/4tb-external/home-backup/snapshots"), 24 * 8),
+    ("session-log", ("file", HOME/".local/state/daily-session-log.log"),        24),
+    ("brief",       ("file", HOME/".local/state/brief.log"),                    24),
+    ("index",       ("file", HOME/".local/state/vault-search.db"),              24 * 7),
+    ("ct-watch",    ("file", HOME/"Investigations/old_stories/NDA/evidence/crtsh/watch"), 12),
+    ("fara",        ("systemd", "fara-watch.timer"),                            24),
+    ("congress",    ("systemd", "congress-watch.timer"),                        24),
+    ("donor",       ("systemd", "donor-watch.timer"),                           24 * 7),
+    ("gift-travel", ("systemd", "gift-travel-watch.timer"),                     24 * 7),
+    ("backup",      ("systemd", "home-backup.timer"),                           24 * 8),
+    ("autocommit",  ("systemd", "notebook-autocommit.timer"),                   2),
 ]
+
+
+def _systemd_last():
+    """{unit: epoch} from `systemctl --user list-timers`. Empty dict if unavailable."""
+    import subprocess, datetime as _dt
+    out = {}
+    try:
+        r = subprocess.run(["systemctl", "--user", "list-timers", "--all", "--no-pager",
+                            "--output=json"], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            for row in json.loads(r.stdout):
+                us = row.get("last")
+                if isinstance(us, int) and us > 0:
+                    out[row.get("unit", "")] = us / 1_000_000
+    except Exception:
+        pass
+    return out
 
 
 def health_line():
@@ -221,29 +246,30 @@ def health_line():
     so. This puts every job's liveness into the one artefact that gets read daily."""
     import time
     now, parts, stale = time.time(), [], False
-    for label, path, cadence in HEALTH:
-        try:
-            if path.is_dir():
-                ts = max((f.stat().st_mtime for f in path.iterdir()), default=0)
-            else:
-                ts = path.stat().st_mtime
-        except Exception:
-            ts = 0
-        if not ts:
-            # An external drive that is simply unplugged is not a dead job. Saying
-            # so avoids a standing false alarm, which is how a health line gets
-            # ignored — the exact failure it exists to prevent.
-            if not path.parent.exists():
-                parts.append(f"{label} n/a"); continue
-            parts.append(f"{label} never"); stale = True; continue
-        age_h = (now - ts) / 3600
-        if age_h > cadence * 2:
-            parts.append(f"**{label} {int(age_h // 24)}d**" if age_h >= 24 else f"**{label} {int(age_h)}h**")
-            stale = True
+    timers = _systemd_last()
+    for label, (kind, target), cadence in HEALTH:
+        ts = 0
+        if kind == "systemd":
+            ts = timers.get(target, 0)
         else:
-            parts.append(f"{label} {int(age_h // 24)}d" if age_h >= 24 else f"{label} {int(age_h)}h")
-    mark = "⚠ " if stale else ""
-    return f"_{mark}health: " + " · ".join(parts) + "_"
+            try:
+                ts = (max((f.stat().st_mtime for f in target.iterdir()), default=0)
+                      if target.is_dir() else target.stat().st_mtime)
+            except Exception:
+                ts = 0
+        if not ts:
+            # An unplugged external drive or an absent unit is not a dead job.
+            # A standing false alarm is how a health line gets ignored.
+            if kind == "file" and not target.parent.exists():
+                parts.append(f"{label} n/a"); continue
+            parts.append(f"{label} ?"); continue
+        age_h = (now - ts) / 3600
+        txt = f"{int(age_h // 24)}d" if age_h >= 24 else f"{int(age_h)}h"
+        if age_h > cadence * 2:
+            parts.append(f"**{label} {txt}**"); stale = True
+        else:
+            parts.append(f"{label} {txt}")
+    return f"_{'⚠ ' if stale else ''}health: " + " · ".join(parts) + "_"
 
 
 def block(lines):
@@ -291,6 +317,12 @@ def main():
     lines, surfaced = render(s, record=True)
     note, changed = write_note(block(lines))
     save_state(s)
+    # Log EVERY run, not only failures. The health footer reads this file's mtime,
+    # so a log written only on error means the entry tracks "time since last error"
+    # rather than "time since last run" — and a brief that works perfectly every day
+    # would slowly age into a false alarm. A health line that cries wolf is a health
+    # line that gets ignored, which is the failure this whole footer exists to catch.
+    log(f"ran: {len(lines)} slot(s) filled, {'wrote' if changed else 'no change to'} {note.name}")
     print(f"{len(lines)} slot(s) filled, {'wrote' if changed else 'no change to'} {note.name}")
     return 0
 
