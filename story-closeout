@@ -429,7 +429,36 @@ if [[ -n "$STORY_PAGE" ]]; then
             echo "Story page: would set status: published in $(basename "$STORY_PAGE") (no media moved)"
         fi
     else
-        STORY_PAGE="$STORY_PAGE" MEDIA_DEST="$MEDIA_DEST" MEDIA_MOVED="$MEDIA_MOVED" python3 - <<'PYSET'
+        STORY_PAGE="$STORY_PAGE" MEDIA_DEST="$MEDIA_DEST" MEDIA_MOVED="$MEDIA_MOVED" \
+        REPO="$(dirname "$(readlink -f "$0")")" python3 - <<'PYSET'
+import os, re, sys, pathlib
+# Same frontmatter writer the other tools use — this was the third hand-rolled copy,
+# and the YAML edge cases it will eventually hit are identical in all of them.
+sys.path.insert(0, os.environ.get("REPO", ""))
+try:
+    import vaultfm
+    setk = vaultfm.set_scalar
+except Exception:                      # keep closeout working if the repo moves
+    def setk(fm, k, v):
+        if re.search(rf'^{k}:', fm, re.M):
+            return re.sub(rf'^{k}:.*$', f'{k}: {v}', fm, count=1, flags=re.M)
+        return fm.rstrip("\n") + f"\n{k}: {v}"
+
+p = pathlib.Path(os.environ["STORY_PAGE"])
+t = p.read_text()
+fm, body, _ = (vaultfm.split(t) if "vaultfm" in dir() else (None, None, None))
+if fm:
+    fm = setk(fm, "status", "published")
+    if os.environ.get("MEDIA_MOVED") == "1":
+        fm = setk(fm, "media_archive", f'"{os.environ["MEDIA_DEST"]}"')
+    new = f"---\n{fm}\n---\n{body}"
+    if new != t:
+        p.write_text(new)
+        print(f"Story page: {p.name} → status: published" +
+              (", media_archive recorded" if os.environ.get("MEDIA_MOVED") == "1" else ""))
+    else:
+        print(f"Story page: {p.name} already current")
+PYSET'
 import os, re, pathlib
 p = pathlib.Path(os.environ["STORY_PAGE"])
 t = p.read_text()

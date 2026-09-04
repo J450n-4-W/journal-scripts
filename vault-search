@@ -20,6 +20,11 @@ Two modes with opposite optimisations:
 Spec and measurements: ~/notebook/pages/vault-search.md
 """
 import os, re, sys, json, time, sqlite3, hashlib, pathlib, fnmatch, argparse
+# Shared frontmatter handling. Three tools carried their own copy of the same
+# set-scalar function; a fix in one silently left the others broken.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import vaultfm
+
 
 try:
     import tomllib
@@ -101,13 +106,11 @@ def scan(man):
 
 # ── parsing and chunking ──────────────────────────────────────────────────────
 
-FM_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n?', re.S)
 LINK_RE = re.compile(r'\[\[([^\]|#]+)')
 
 
 def split_frontmatter(text):
-    m = FM_RE.match(text)
-    return (m.group(1), text[m.end():], text[:m.end()].count("\n")) if m else ("", text, 0)
+    return vaultfm.split(text)
 
 
 def parse_frontmatter(fm):
@@ -403,29 +406,8 @@ def drop_vectors(c, doc_id):
         pass          # vector table absent; nothing to clean
 
 
-DATE_RE = [
-    (re.compile(r'^(\d{4})-(\d{2})-(\d{2})'),                     lambda m: f"{m[1]}-{m[2]}-{m[3]}"),
-    (re.compile(r'^(\d{2})/(\d{2})/(\d{4})'),                     lambda m: f"{m[3]}-{m[2]}-{m[1]}"),
-    (re.compile(r'^([A-Z][a-z]{2})\w*\s+(\d{1,2}),?\s+(\d{4})'), None),
-]
-MONTHS = {m: f"{i:02d}" for i, m in enumerate(
-    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
-
-
 def norm_date(v):
-    """--since compared raw strings, so 'Sep 3, 2026' and '03/09/2026' were silently
-    excluded by any ISO cutoff. Normalise at index time instead."""
-    v = str(v or "").strip().strip('"\'')
-    if not v or v.lower() in ("null", "none", "~") or v.startswith("{{"):
-        return ""                      # unfilled template placeholders and YAML nulls
-    v = v.replace("_", "-")            # journal filenames use 2026_09_04
-    for rx, fn in DATE_RE:
-        m = rx.match(v)
-        if not m: continue
-        if fn: return fn(m)
-        mon = MONTHS.get(m[1][:3])
-        if mon: return f"{m[3]}-{mon}-{int(m[2]):02d}"
-    return v[:10]
+    return vaultfm.norm_date(v)
 
 
 def index_cmd(args):

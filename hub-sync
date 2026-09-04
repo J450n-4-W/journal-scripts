@@ -23,9 +23,13 @@ Usage:
     hub-sync --dry-run    print the block that would be written, write nothing
 """
 import os, re, sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import vaultfm
+
 
 HOME = pathlib.Path.home()
 BEGIN, END = "<!-- hub-sync:begin -->", "<!-- hub-sync:end -->"
+SENT_END = re.compile(r"(?<=[.!?])\s")
 
 TARGETS = [
     ("tools",  HOME/".local/bin",      HOME/"notebook/pages/CLI Tools.md"),
@@ -49,30 +53,18 @@ def desc_from_script(p):
 
 def desc_from_skill(p):
     """First sentence of the SKILL.md frontmatter description. Skill descriptions carry
-    long trigger lists that are useful to the agent and unreadable in a table."""
+    long trigger lists that are useful to the agent and unreadable in a table. Folded
+    scalars (`description: >`) are handled in vaultfm — four skills use that form and a
+    naive parser returned a literal '>'."""
     try:
         text = p.read_text(errors="ignore")
     except Exception:
         return ""
-    m = re.search(r'^---\s*$(.*?)^---\s*$', text, re.S | re.M)
-    if not m:
+    fm, _, _ = vaultfm.split(text)
+    if not fm:
         return ""
-    fm = m.group(1)
-    d = re.search(r'^description:[ \t]*(.*)$', fm, re.M)
-    if not d:
-        return ""
-    s = d.group(1).strip().strip('"\'')
-    # YAML folded/literal scalar: the value is the indented block that follows.
-    if s in ("", ">", "|") or re.fullmatch(r'[>|][-+]?\d*', s):
-        tail = fm[d.end():].splitlines()
-        parts = []
-        for line in tail[1:] if tail and not tail[0].strip() else tail:
-            if line.strip() and not line[:1].isspace():
-                break
-            if line.strip():
-                parts.append(line.strip())
-        s = " ".join(parts)
-    return re.split(r'(?<=[.!?])\s', s)[0].rstrip('.') if s else ""
+    d = vaultfm.folded(fm, "description")
+    return re.split(SENT_END, d)[0].rstrip(".") if d else ""
 
 
 def frontmatter_defects(root):

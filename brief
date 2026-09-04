@@ -16,6 +16,9 @@ Usage:
     brief --rollup       weekly aged-out report
 """
 import os, re, sys, json, time, pathlib, datetime, subprocess
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import vaultfm
+
 
 HOME = pathlib.Path.home()
 JOURNALS = HOME/"notebook/journals"

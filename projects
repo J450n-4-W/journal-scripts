@@ -15,6 +15,11 @@ Usage:
     projects new NAME   create a page from templates/story.md with status: research
 """
 import os, re, sys, pathlib, datetime, subprocess
+# Shared frontmatter handling. Three tools carried their own copy of the same
+# set-scalar function; a fix in one silently left the others broken.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import vaultfm
+
 
 HOME = pathlib.Path.home()
 PAGES = HOME/"notebook/pages"
@@ -24,6 +29,9 @@ SPEC = PAGES/"projects.md"
 TEMPLATE = HOME/"notebook/templates/story.md"
 
 SHELVE_DAYS = 30
+# Derived by this tool. published is terminal (set by story-closeout); everything
+# else in a status field was put there by hand and is not ours to overwrite.
+DERIVED_STATES = {"research", "shelved"}
 SKIP_DIRNAMES = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 CONTAINERS = {"old_stories"}          # holds projects, is not one
 TODAY = datetime.date.today()
@@ -32,34 +40,20 @@ TODAY = datetime.date.today()
 # ── frontmatter ───────────────────────────────────────────────────────────────
 
 def split_fm(text):
-    m = re.match(r'^---\s*\n(.*?)\n---\s*\n?', text, re.S)
-    return (m.group(1), text[m.end():]) if m else (None, text)
+    fm, body, n = vaultfm.split(text)
+    return (fm or None), body
 
 
 def scalar(fm, key):
-    m = re.search(rf'^{key}:[ \t]*(.*)$', fm, re.M)
-    if not m: return ""
-    return m.group(1).strip().strip('"\'')
+    return vaultfm.scalar(fm, key)
 
 
 def yaml_list(fm, key):
-    m = re.search(rf'^{key}:[ \t]*(.*)$', fm, re.M)
-    if not m: return []
-    inline = m.group(1).strip()
-    if inline.startswith("["):
-        return [x.strip().strip('"\'') for x in inline.strip("[]").split(",") if x.strip()]
-    out = []
-    for line in fm[m.end():].splitlines():
-        if re.match(r'^\s*-\s+', line): out.append(re.sub(r'^\s*-\s+', '', line).strip().strip('"\''))
-        elif line.strip() and not line[:1].isspace(): break
-    return out
+    return vaultfm.yaml_list(fm, key)
 
 
 def set_scalar(fm, key, value):
-    """Replace or append a single key. Never reserialises — everything else is untouched."""
-    if re.search(rf'^{key}:', fm, re.M):
-        return re.sub(rf'^{key}:.*$', f'{key}: {value}', fm, count=1, flags=re.M)
-    return fm.rstrip("\n") + f"\n{key}: {value}"
+    return vaultfm.set_scalar(fm, key, value)
 
 
 def resolve(p):
@@ -91,6 +85,7 @@ class Record:
         self.fm, self.body = split_fm(self.text)
         self.name = path.stem
         self.status = scalar(self.fm, "status")
+        self.hand_set = False
         self.story_dir_raw = scalar(self.fm, "story_dir")
         self.story_dir = resolve(self.story_dir_raw)
         self.media_archive = resolve(scalar(self.fm, "media_archive"))
@@ -141,8 +136,13 @@ class Record:
         # way, published must not be demoted: a story whose dir is gone reads as
         # maximally quiet, and one whose dir remains keeps accruing mtime from
         # unrelated file activity. Both would win the abandoned slot wrongly.
-        if self.status == "published":
-            self.derived_status = "published"
+        # Only two states are DERIVED. Anything else is hand-owned and left alone:
+        # a reporting workflow has more states than a mtime can infer (pitched,
+        # awaiting-response, killed, on-hold, spiked), and overwriting them every
+        # morning would make the field useless for the human who set it.
+        if self.status and self.status not in DERIVED_STATES:
+            self.derived_status = self.status
+            self.hand_set = True
         elif self.days_quiet is None or self.days_quiet >= SHELVE_DAYS:
             self.derived_status = "shelved"
         else:
@@ -247,6 +247,11 @@ def main():
     for r in stale:
         was = r.status or "unset"
         print(f"stale status: {r.name} is '{was}', should be '{r.derived_status}'")
+    hand = [r for r in records if r.hand_set]
+    if hand:
+        print(f"hand-set statuses (left alone): "
+              + ", ".join(f"{r.name}={r.status}" for r in hand[:5])
+              + (f" +{len(hand)-5} more" if len(hand) > 5 else ""))
     for r in unset:
         print(f"no story_dir: {r.name} — cannot track activity until one is set")
     for r in missing:
