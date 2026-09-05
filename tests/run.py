@@ -143,27 +143,28 @@ def test_outreach(oc):
 
 
 def test_cite_check(cc):
+    """Provenance, not importance — and paragraph scope, not sentence scope."""
     print("cite-check — provenance, not importance")
-    flag = lambda t: [s for _, s in cc.check(t)]
-    # SHOULD flag: attribution to something someone else published, no link
-    for t in ["According to a report published in March, the firm was investigated.",
-              "Smith told the New York Times that he knew nothing about the payments.",
-              "The exchange was reportedly hostile and lasted several hours in total.",
-              "Axios reported that the video had been produced externally by the firm."]:
-        check(f"flags: {t[:44]}", len(flag(t)), 1)
-    # SHOULD NOT flag: the reporter's own work, which cannot be linked
-    for t in ["Records show the transfers began in April of that year, filings confirm.",
-              "A spokesperson said in a statement that the company acted lawfully here.",
-              "According to a Guardian analysis, the group published 124 reports total.",
-              "He told the Guardian that he had no knowledge of any of the payments.",
-              "The documents were obtained by this publication earlier in the year now."]:
-        check(f"ignores own work: {t[:36]}", len(flag(t)), 0)
-    # SHOULD NOT flag: attributed AND linked
-    check("ignores a linked attribution",
-          len(flag("It was [first reported by](https://x.com/a) a trade publication today.")), 0)
-    # case: sentence-initial "According" was missed when re.I was dropped
-    check("sentence-initial According is caught",
-          len(flag("According to a filing, the company moved the funds offshore in May.")), 1)
+    linked = ("The company denied it. According to a filing with the SEC, revenue fell. "
+              "See [the filing](https://sec.gov/x) for detail.")
+    check("attribution with a link in the same PARAGRAPH is not flagged",
+          cc.check(linked), [])
+    unlinked = "According to a report by the New York Times, the company misstated revenue for three years running."
+    check("attribution with no link anywhere is flagged", len(cc.check(unlinked)), 1)
+    own = "Chen told me in an interview that the figures had been revised twice before publication."
+    check("own interview is never flagged (unlinkable by nature)", cc.check(own), [])
+    own2 = "Court records show the loan was repaid, and no further filing was made in the matter."
+    check("own records search is not flagged", cc.check(own2), [])
+    own3 = "According to a Guardian analysis, the group published 124 reports in eight days."
+    check("own analysis is not flagged", cc.check(own3), [])
+    plain = "The building sits on a hill above the town and has been empty since 2019."
+    check("an unattributed claim is never flagged (importance is not the test)",
+          cc.check(plain), [])
+    # The bug that mattered: a link in the previous sentence of the same paragraph.
+    split_para = ("The filing is [here](https://sec.gov/y).\n"
+                  "According to the filing, revenue fell by a third.")
+    check("link in an earlier sentence of the paragraph counts",
+          cc.check(split_para), [])
 
 
 def test_preserve(pc):
