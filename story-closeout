@@ -34,6 +34,12 @@ usage() {
     echo "  --slug NAME        Override the directory name for archive/assets subfolders"
     echo "  --date YYYY_MM     Reporting date prefix for media archive (e.g. 2026_03)"
     echo "                     Defaults to current year_month"
+    echo "  --outreach-match S Subject substring identifying this story's outreach"
+    echo "                     (default: the slug). Matched mail is classified by"
+    echo "                     outcome and written to the story page."
+    echo "  --outreach-since/--outreach-until YYYY-MM-DD"
+    echo "                     Override the reporting window. Default is derived from"
+    echo "                     file mtimes, which drift if the folder is touched later."
     echo "  --dry-run, -n      Print every copy/move that would happen, change nothing"
     echo ""
     echo "Example: story-closeout ~/Investigations/old_stories/Schwemmer --date 2026_03"
@@ -46,12 +52,16 @@ STORY_DIR="$1"
 shift
 
 SLUG=""
+OUTREACH_MATCH=""; OUTREACH_SINCE=""; OUTREACH_UNTIL=""
 DATE_PREFIX=""
 DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --slug) SLUG="$2"; shift 2 ;;
         --date) DATE_PREFIX="$2"; shift 2 ;;
+        --outreach-match) OUTREACH_MATCH="$2"; shift 2 ;;
+        --outreach-since) OUTREACH_SINCE="$2"; shift 2 ;;
+        --outreach-until) OUTREACH_UNTIL="$2"; shift 2 ;;
         --dry-run|-n) DRY_RUN=1; shift ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -407,36 +417,6 @@ fi
 # NOT invent one. It reports every message sent during the story's active window with
 # its reply status, as candidates for a human to confirm. Guessing by surname would
 # be fabricating a link the data does not support.
-if command -v outreach >/dev/null 2>&1; then
-    WIN_FROM="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | head -1 | cut -d. -f1)"
-    WIN_TO="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
-    if [[ -n "$WIN_FROM" && -n "$WIN_TO" ]]; then
-        FROM_D="$(date -d "@$WIN_FROM" +%Y-%m-%d)"
-        TO_D="$(date -d "@$WIN_TO" +%Y-%m-%d)"
-        OUTREACH_MD="$(outreach window --since "$FROM_D" --until "$TO_D" 2>/dev/null)"
-        if [[ -n "$OUTREACH_MD" ]]; then
-            echo "Outreach in the story's active window ($FROM_D to $TO_D):"
-            echo "$OUTREACH_MD" | head -20 | sed 's/^/  /'
-            n=$(echo "$OUTREACH_MD" | wc -l)
-            [[ "$n" -gt 20 ]] && echo "  … and $((n - 20)) more"
-            if [[ $DRY_RUN -eq 0 && -n "$STORY_PAGE" ]]; then
-                {
-                    echo ""
-                    echo "## Outreach in the working window ($FROM_D to $TO_D)"
-                    echo ""
-                    echo "Every message sent while this story was active, with reply status matched"
-                    echo "by Message-ID. **Candidates, not a verified story list** — there is no"
-                    echo "reliable automatic join between a story and its outreach. Prune by hand."
-                    echo ""
-                    echo "$OUTREACH_MD"
-                } >> "$STORY_PAGE"
-                echo "  → appended to $(basename "$STORY_PAGE")"
-            fi
-            echo ""
-        fi
-    fi
-fi
-
 # --- story page: mark published, record where the media went ---
 # Matched on resolved story_dir, never on page title: frontmatter slugs and on-disk
 # directory names diverge freely (Jace_Yarbrough vs yarbrough, aief-trips vs
@@ -460,6 +440,67 @@ for f in sorted((pathlib.Path(os.environ["VAULT"])/"pages").glob("*.md")):
     except Exception: pass
 PYFIND
 )"
+
+# --- outreach: runs here, AFTER story page resolution, because it writes to it ---
+if command -v outreach >/dev/null 2>&1; then
+    # Window defaults to file mtimes, which drift whenever the folder is touched after
+    # reporting ends — override with --outreach-since/--outreach-until.
+    if [[ -z "$OUTREACH_SINCE" ]]; then
+        W="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | head -1 | cut -d. -f1)"
+        [[ -n "$W" ]] && OUTREACH_SINCE="$(date -d "@$W" +%Y-%m-%d)"
+    fi
+    if [[ -z "$OUTREACH_UNTIL" ]]; then
+        W="$(find "$STORY_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+        [[ -n "$W" ]] && OUTREACH_UNTIL="$(date -d "@$W" +%Y-%m-%d)"
+    fi
+    [[ -z "$OUTREACH_MATCH" ]] && OUTREACH_MATCH="$SLUG"
+
+    if [[ -n "$OUTREACH_SINCE" && -n "$OUTREACH_UNTIL" ]]; then
+        # The record: mail whose SUBJECT names this story, classified by what came back.
+        # Bounces and auto-replies are separated from real answers — a bounce threads onto
+        # the message it failed to deliver, so a naive join reports it as a reply, and a
+        # "no response" line published on that basis would be false.
+        STORY_MD="$(outreach story --match "$OUTREACH_MATCH" \
+                        --since "$OUTREACH_SINCE" --until "$OUTREACH_UNTIL" 2>/dev/null)"
+        if [[ -n "$STORY_MD" ]]; then
+            echo "Outreach matching subject '~$OUTREACH_MATCH' ($OUTREACH_SINCE to $OUTREACH_UNTIL):"
+            echo "$STORY_MD" | sed 's/^/  /'
+            if [[ $DRY_RUN -eq 0 && -n "$STORY_PAGE" ]]; then
+                {
+                    echo ""
+                    echo "## Outreach"
+                    echo ""
+                    echo "Mail whose subject names this story, $OUTREACH_SINCE to $OUTREACH_UNTIL,"
+                    echo "classified by outcome. Bounces and auto-replies are not counted as replies."
+                    echo ""
+                    echo "$STORY_MD"
+                } >> "$STORY_PAGE"
+                echo "  → appended to $(basename "$STORY_PAGE")"
+            fi
+            echo ""
+        fi
+
+        # The check, printed and never written: everything else sent in the window. A
+        # subject match cannot catch mail worded differently — and it will always miss
+        # the person the story is ABOUT, since you do not put their name in a subject
+        # line addressed to them. Read this list; do not archive it.
+        ALL_MD="$(outreach window --since "$OUTREACH_SINCE" --until "$OUTREACH_UNTIL" 2>/dev/null)"
+        if [[ -n "$ALL_MD" ]]; then
+            EXTRA="$(comm -23 \
+                <(echo "$ALL_MD"   | grep -oE '`[^`]+`' | tr -d '`' | sort -u) \
+                <(echo "$STORY_MD" | grep -oE '`[^`]+`' | tr -d '`' | sort -u))"
+            n=$(echo "$EXTRA" | grep -c . || true)
+            if [[ "$n" -gt 0 ]]; then
+                echo "Completeness check — $n other address(es) mailed in the same window."
+                echo "Not archived. Scan for anyone approached under different wording:"
+                echo "$EXTRA" | head -25 | sed 's/^/    /'
+                [[ "$n" -gt 25 ]] && echo "    … and $((n - 25)) more"
+                echo ""
+            fi
+        fi
+    fi
+fi
+
 
 if [[ -n "$STORY_PAGE" ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then

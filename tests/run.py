@@ -183,12 +183,33 @@ def test_preserve(pc):
     pathlib.Path(name).unlink()
 
 
+def test_brief_under_cron():
+    """The health footer worked interactively and was blind under cron, which is the
+    only environment that runs it: systemctl --user needs a session bus and cron has
+    none. Test in a stripped environment, not the shell you happen to be in."""
+    print("brief — health footer under a cron-like environment")
+    import subprocess
+    brief = pathlib.Path.home()/".local/bin/brief"
+    if not brief.exists():
+        check("brief installed", False); return
+    r = subprocess.run([str(brief), "--show"], capture_output=True, text=True, timeout=180,
+                       env={"HOME": str(pathlib.Path.home()),
+                            "PATH": f"{pathlib.Path.home()}/.local/bin:/usr/bin:/bin"})
+    line = next((l for l in r.stdout.splitlines() if l.startswith("_health")), "")
+    check("health line produced", bool(line))
+    check("no unknown entries (systemd reachable without a session bus)",
+          "?" not in line, cmp=lambda v: v is True)
+    check("PATH-dependent checks resolve (hub-sync, projects found)",
+          "maintenance check failed" not in r.stdout)
+
+
 def main():
     vs = load("vault-search"); pj = load("projects"); hs = load("hub-sync")
     test_chunker(vs); test_dates(vs); test_fts_query(vs)
     test_binary_guard(vs); test_frontmatter(vs)
     test_projects(pj); test_hub_sync(hs)
     test_outreach(load("outreach"))
+    test_brief_under_cron()
     test_cite_check(load("cite-check"))
     test_preserve(load("preserve-check"))
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -237,6 +237,70 @@ def thread_cmd(a):
     return 0
 
 
+# --- classification of what came back ------------------------------------------
+# A message threaded onto one you sent is not necessarily a reply. Bounces name the
+# original in References, so a naive join counts "Undeliverable" as an answer — which
+# is the worst possible error for a story, because it reads as "they responded" when
+# in fact they were never reached. Auto-replies are a milder version of the same.
+BOUNCE_FROM = ("mailer-daemon", "postmaster", "mail-daemon")
+BOUNCE_SUBJ = ("undeliverable", "delivery status notification", "mail delivery failed",
+               "returned mail", "delivery has failed", "message not delivered")
+AUTO_SUBJ   = ("automatic reply", "out of office", "autoreply", "auto-reply",
+               "away from my mail", "vacation reply")
+
+def classify(from_addr, subject):
+    f = (from_addr or "").lower(); s = (subject or "").lower()
+    if any(b in f for b in BOUNCE_FROM) or any(b in s for b in BOUNCE_SUBJ): return "bounce"
+    if any(a in s for a in AUTO_SUBJ): return "auto"
+    return "reply"
+
+
+def story_cmd(a):
+    """Outreach for one story, classified by outcome.
+
+    Joins on SUBJECT, not on a date window alone. A request for comment carries a
+    subject naming the story, so that is a real link rather than an inferred one.
+    Two limits the caller must know: it will miss mail whose subject omits the term
+    (notably the person the story is ABOUT — you do not put their name in a subject
+    line to them), and it will miss anyone contacted under a different wording. The
+    date window is still printed as a completeness check for exactly that reason.
+    """
+    c = sqlite3.connect(DB); c.executescript(SCHEMA)
+    lo = time.mktime(time.strptime(a.since, "%Y-%m-%d"))
+    hi = time.mktime(time.strptime(a.until, "%Y-%m-%d")) + 86400
+    sent = c.execute("""SELECT msgid, ts, subject, to_addrs FROM msg
+                        WHERE direction='sent' AND ts BETWEEN ? AND ? AND subject LIKE ?
+                        ORDER BY ts""", (lo, hi, f"%{a.match}%")).fetchall()
+    if not sent:
+        print(f"- (no outreach matching '{a.match}' between {a.since} and {a.until})"); return 1
+    recv = c.execute("SELECT ts, from_addr, subject, refs FROM msg "
+                     "WHERE direction='recv' AND refs != ''").fetchall()
+    rec = {}
+    for mid, ts, subj, tos in sent:
+        if a.skip and a.skip in (tos or ""): continue
+        for addr in [x.strip().lower() for x in (tos or "").split(",") if x.strip()]:
+            e = rec.setdefault(addr, {"first": ts, "bounce": False, "auto": False, "reply": None})
+            e["first"] = min(e["first"], ts)
+            for rts, frm, rsubj, refs in recv:
+                if mid not in refs: continue
+                k = classify(frm, rsubj)
+                if k == "bounce": e["bounce"] = True
+                elif k == "auto": e["auto"] = True
+                elif e["reply"] is None or rts < e["reply"]: e["reply"] = rts
+    d = lambda t: time.strftime("%d %b %Y", time.localtime(t))
+    for addr, e in sorted(rec.items(), key=lambda kv: kv[1]["first"]):
+        if e["reply"]:      st = f"replied {d(e['reply'])}"
+        elif e["bounce"]:   st = "**BOUNCED — never delivered**"
+        elif e["auto"]:     st = "auto-reply only, no substantive response"
+        else:               st = "delivered, no reply"
+        print(f"- `{addr}` — sent {d(e['first'])}, {st}")
+    nb = sum(1 for e in rec.values() if e["bounce"] and not e["reply"])
+    if nb:
+        print(f"\n> {nb} message(s) never reached the recipient. "
+              f"A 'no response' claim about them would be false.")
+    return 0
+
+
 def stat_cmd(a):
     if not DB.exists():
         print("not indexed — run `outreach index`"); return 1
@@ -261,6 +325,12 @@ def main():
     w = sub.add_parser("window"); w.add_argument("--since", required=True)
     w.add_argument("--until", required=True); w.set_defaults(fn=window_cmd)
     t = sub.add_parser("thread"); t.add_argument("who"); t.set_defaults(fn=thread_cmd)
+    st = sub.add_parser("story", help="outreach for one story, classified by outcome")
+    st.add_argument("--match", required=True, help="subject substring identifying the story")
+    st.add_argument("--since", required=True); st.add_argument("--until", required=True)
+    st.add_argument("--skip", default="theguardian.com",
+                    help="substring of recipients to exclude (desk mail, not outreach)")
+    st.set_defaults(fn=story_cmd)
     s = sub.add_parser("stat"); s.set_defaults(fn=stat_cmd)
     a = ap.parse_args(); return a.fn(a) or 0
 

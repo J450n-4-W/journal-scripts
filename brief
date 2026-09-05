@@ -264,19 +264,31 @@ HEALTH = [
 
 
 def _systemd_last():
-    """{unit: epoch} from `systemctl --user list-timers`. Empty dict if unavailable."""
-    import subprocess, datetime as _dt
+    """{unit: epoch} from `systemctl --user list-timers`. Empty dict if unavailable.
+
+    cron has no session bus, so a bare `systemctl --user` fails with 'Failed to
+    connect to bus: No medium found' and every timer reports as unknown. This worked
+    when tested interactively and was blind in the only environment that runs it —
+    supply the runtime directory and bus address explicitly."""
+    import subprocess
+    env = dict(os.environ)
+    uid = os.getuid()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
     out = {}
     try:
         r = subprocess.run(["systemctl", "--user", "list-timers", "--all", "--no-pager",
-                            "--output=json"], capture_output=True, text=True, timeout=15)
+                            "--output=json"], capture_output=True, text=True, timeout=15,
+                           env=env)
         if r.returncode == 0 and r.stdout.strip():
             for row in json.loads(r.stdout):
                 us = row.get("last")
                 if isinstance(us, int) and us > 0:
                     out[row.get("unit", "")] = us / 1_000_000
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"systemd timer query failed: {type(e).__name__}: {e}")
+    if not out:
+        log("systemd timer query returned nothing — timer health is blind")
     return out
 
 
