@@ -29,9 +29,17 @@ SPEC = PAGES/"projects.md"
 TEMPLATE = HOME/"notebook/templates/story.md"
 
 SHELVE_DAYS = 30
-# Derived by this tool. published is terminal (set by story-closeout); everything
-# else in a status field was put there by hand and is not ours to overwrite.
+# Three categories, not two.
+#   DERIVED   — computed here from activity, overwritten freely.
+#   TERMINAL  — set by a tool (story-closeout on publication). Respected, and NOT
+#               reported as an anomaly: 15 published stories showing up under
+#               "hand-set statuses" every morning is noise that trains you to skip
+#               the line, which is how a check stops being read.
+#   hand-set  — anything else a human put there (active-reporting, killed, pitched,
+#               awaiting-response). Left alone AND worth surfacing, because it means
+#               a human is tracking something the tool cannot infer.
 DERIVED_STATES = {"research", "shelved"}
+TERMINAL_STATES = {"published"}
 SKIP_DIRNAMES = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 CONTAINERS = {"old_stories"}          # holds projects, is not one
 TODAY = datetime.date.today()
@@ -142,7 +150,7 @@ class Record:
         # morning would make the field useless for the human who set it.
         if self.status and self.status not in DERIVED_STATES:
             self.derived_status = self.status
-            self.hand_set = True
+            self.hand_set = self.status not in TERMINAL_STATES
         elif self.days_quiet is None or self.days_quiet >= SHELVE_DAYS:
             self.derived_status = "shelved"
         else:

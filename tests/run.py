@@ -93,6 +93,15 @@ def test_projects(pj):
         hs = recs.get("hand-set-status.md")
         check("hand-set status preserved", hs and hs.derived_status, "awaiting-response")
         check("hand-set status flagged", hs and hs.hand_set, True)
+        shutil.copy(FIX/"terminal-status.md", t/"terminal-status.md")
+        pj.PAGES = t
+        recs = {r.path.name: r.compute({}) for r in pj.load_records()}
+        term = recs.get("terminal-status.md")
+        check("published is terminal, not demoted", term and term.derived_status, "published")
+        check("published is NOT reported as hand-set (15 pages of daily noise)",
+              term and term.hand_set, False)
+        hs = recs.get("hand-set-status.md")
+        check("a genuinely hand-set status IS reported", hs and hs.hand_set, True)
         before = (t/"hand-set-status.md").read_text()
         hs.write_back()
         after = (t/"hand-set-status.md").read_text()
