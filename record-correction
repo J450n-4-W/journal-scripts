@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""record-correction — append one correction to the evaluation set, at the moment it
+happens, from whichever agent happens to be working.
+
+Why this exists alongside the nightly scrape in daily-session-log: that scrape reads
+Claude Code transcripts. Work done on 2026-09-05 produced 133 changed vault files and
+left NO transcript anywhere on the machine, so the nightly path saw nothing. Any agent
+that does not write Claude Code transcripts is invisible to it.
+
+This path is cooperative rather than observational: the agent calls it when the
+Corrections procedure in CLAUDE.md fires. That procedure already has a sharp trigger —
+"a later search corrects something already written down" — so this attaches to a
+moment that is already recognised rather than inventing a new one to notice.
+
+It reaches other agents because ~/AGENTS.md symlinks to ~/.claude/CLAUDE.md, so the
+instruction surface is already shared.
+
+A CLI rather than a documented file format on purpose: the caller never sees the
+schema, ids continue the day's sequence instead of restarting, the trailing newline is
+guaranteed, and a malformed record becomes impossible rather than merely logged.
+
+Usage:
+    record-correction --wrong "what was asserted" --right "what it should be" \\
+        --origin misread-document [--source URL] [--surface PATH] \\
+        [--context "..."] [--trigger "..."] [--project TAG] [--unresolved]
+    record-correction --list [--today]
+"""
+import os, re, sys, json, time, pathlib, argparse, datetime
+
+FILE = pathlib.Path(os.environ.get("CORRECTIONS_FILE",
+                                   pathlib.Path.home()/".local/state/corrections.jsonl"))
+ORIGINS = ["model-fabrication", "stale-source", "tool-behaviour", "misread-document",
+           "transcription-artefact", "search-snippet", "other"]
+
+
+def load():
+    if not FILE.exists():
+        return []
+    out = []
+    for line in FILE.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass          # a malformed legacy line must not block a new one
+    return out
+
+
+def next_id(records, today):
+    """Continue the day's sequence. Restarting at 01 on a second run of the day
+    produced colliding ids in the nightly path."""
+    n = sum(1 for r in records if str(r.get("id", "")).startswith(today))
+    return f"{today}-{n + 1:02d}"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="record-correction", add_help=True)
+    ap.add_argument("--wrong", help="the claim as asserted")
+    ap.add_argument("--right", help="what it should have been")
+    ap.add_argument("--origin", choices=ORIGINS, help="what produced the error")
+    ap.add_argument("--source", default="", help="URL or path that settled it")
+    ap.add_argument("--surface", default="chat", help="file the wrong claim appeared in")
+    ap.add_argument("--context", default="", help="what was being worked on")
+    ap.add_argument("--trigger", default="", help="the question that produced it — "
+                                                  "needed to replay the case later")
+    ap.add_argument("--project", default="", help="project tag")
+    ap.add_argument("--generalisable", action="store_true",
+                    help="this is a trap that should become a rule, not a one-off")
+    ap.add_argument("--unresolved", action="store_true",
+                    help="could not be verified either way")
+    ap.add_argument("--via", default="live", choices=["live", "nightly"])
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--today", action="store_true")
+    a = ap.parse_args()
+
+    records = load()
+    today = datetime.date.today().isoformat()
+
+    if a.list:
+        rows = [r for r in records if not a.today or str(r.get("id","")).startswith(today)]
+        if not rows:
+            print("no records" + (" today" if a.today else "")); return 0
+        for r in rows:
+            print(f"{r.get('id')}  [{r.get('origin')}]  via={r.get('via','nightly')}")
+            print(f"   wrong: {str(r.get('claim_wrong',''))[:110]}")
+            print(f"   right: {str(r.get('claim_right',''))[:110]}")
+        return 0
+
+    missing = [f for f, v in (("--wrong", a.wrong), ("--right", a.right),
+                              ("--origin", a.origin)) if not v]
+    if missing:
+        print(f"record-correction: required: {', '.join(missing)}", file=sys.stderr)
+        print("  run with -h for the full field list", file=sys.stderr)
+        return 2
+
+    # Refuse an exact duplicate of something already recorded today. Both paths are
+    # live — an agent recording in the moment and the 23:30 scrape reading the same
+    # day's transcripts — so the same correction can arrive twice.
+    norm = lambda s: " ".join(str(s or "").lower().split())
+    for r in records:
+        if str(r.get("id","")).startswith(today) and norm(r.get("claim_wrong")) == norm(a.wrong):
+            print(f"already recorded today as {r.get('id')} — not duplicating")
+            return 0
+
+    rec = {
+        "id": next_id(records, today),
+        "date": today,
+        "project": a.project,
+        "claim_wrong": a.wrong,
+        "claim_right": a.right,
+        "source_settled": a.source,
+        "surface": a.surface,
+        "origin": a.origin,
+        "generalisable": bool(a.generalisable),
+        "resolved": not a.unresolved,
+        "context": a.context,
+        "trigger": a.trigger,
+        "via": a.via,
+    }
+    FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Guarantee a trailing newline before appending, or this record glues onto the
+    # previous one and the validator loses both.
+    if FILE.exists() and FILE.stat().st_size:
+        with open(FILE, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            need_nl = f.read(1) != b"\n"
+        if need_nl:
+            with open(FILE, "a") as f:
+                f.write("\n")
+    with open(FILE, "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"recorded {rec['id']} [{a.origin}]")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

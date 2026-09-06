@@ -7,7 +7,7 @@ rather than crashing — the failure mode that produced every entry below.
 
 Run: python3 tests/run.py
 """
-import sys, pathlib, importlib.machinery, importlib.util, tempfile, shutil, re
+import os, sys, pathlib, importlib.machinery, importlib.util, tempfile, shutil, re
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FIX = REPO/"tests/fixtures"
@@ -213,6 +213,39 @@ def test_brief_under_cron():
           "maintenance check failed" not in r.stdout)
 
 
+def test_record_correction():
+    """The cooperative path: any agent, at the moment of correction. The nightly
+    transcript scrape cannot see work done outside Claude Code — 133 vault files
+    changed on 2026-09-05 and it saw nothing."""
+    print("record-correction — cross-agent capture")
+    import subprocess, tempfile, json as _json
+    exe = REPO/"record-correction"
+    with tempfile.TemporaryDirectory() as td:
+        f = pathlib.Path(td)/"c.jsonl"
+        env = {**os.environ, "CORRECTIONS_FILE": str(f)}
+        run = lambda *a: subprocess.run([sys.executable, str(exe), *a],
+                                        capture_output=True, text=True, env=env)
+        r = run("--wrong", "DOI was nutd.2016.20", "--right", "DOI is nutd.2016.32",
+                "--origin", "misread-document", "--trigger", "verify the DOI")
+        check("records a correction", r.returncode, 0)
+        r2 = run("--wrong", "DOI was nutd.2016.20", "--right", "x", "--origin", "other")
+        check("refuses an exact duplicate from the other path", "not duplicating" in r2.stdout)
+        r3 = run("--wrong", "second thing", "--right", "fixed", "--origin", "stale-source")
+        check("continues the day's id sequence, does not restart at 01",
+              "-02" in r3.stdout, cmp=lambda v: v is True)
+        # A legacy line with no trailing newline must not corrupt the next append.
+        with open(f, "a") as fh: fh.write('{"id":"legacy","claim_wrong":"no newline"}')
+        run("--wrong", "third", "--right", "y", "--origin", "other")
+        lines = [l for l in f.read_text().splitlines() if l.strip()]
+        ok = all((_json.loads(l) or True) for l in lines)
+        check("file stays valid JSONL after a missing-newline append", ok)
+        r4 = run("--wrong", "only", "--right", "half")
+        check("refuses an incomplete record rather than writing a partial one",
+              r4.returncode, 2)
+        bad = run("--wrong", "a", "--right", "b", "--origin", "not-a-real-origin")
+        check("rejects an out-of-enum origin", bad.returncode != 0, True)
+
+
 def main():
     vs = load("vault-search"); pj = load("projects"); hs = load("hub-sync")
     test_chunker(vs); test_dates(vs); test_fts_query(vs)
@@ -220,6 +253,7 @@ def main():
     test_projects(pj); test_hub_sync(hs)
     test_outreach(load("outreach"))
     test_brief_under_cron()
+    test_record_correction()
     test_cite_check(load("cite-check"))
     test_preserve(load("preserve-check"))
     print(f"\n{PASS} passed, {FAIL} failed")

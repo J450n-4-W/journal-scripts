@@ -128,34 +128,35 @@ Process:
 
    From today's transcripts, identify each instance where: a claim was
    asserted and later found wrong; a claim could not be verified; or a
-   sourcing trap was discovered. For each one, append a single line of JSON
-   to ${CORRECTIONS_FILE} with exactly these keys:
+   sourcing trap was discovered.
 
-     id             string  "${TODAY}-01", "${TODAY}-02", ... If the file already has
-                            records for today, CONTINUE the sequence instead of
-                            restarting at 01 (check: tail -1 ${CORRECTIONS_FILE})
-     date           string  "${TODAY}"
-     project        string  the project tag for today
-     claim_wrong    string  what was asserted
-     claim_right    string  what it should have been
-     source_settled string  URL or file path that resolved it; "" if unresolved
-     surface        string  file path where the wrong claim appeared, or "chat"
-     origin         string  one of: model-fabrication, stale-source,
-                            tool-behaviour, misread-document,
-                            transcription-artefact, search-snippet, other
-     generalisable  boolean whether this is a trap that should become a rule
-     resolved       boolean false for "could not be verified" entries
-     context        string  what was being worked on when it happened
-     trigger        string  the question or task that produced the wrong claim,
-                            in enough detail to re-pose it later
+   For each one, call the CLI — do NOT write the file by hand:
+
+     record-correction --wrong "what was asserted" \
+                       --right "what it should have been" \
+                       --origin <one of: model-fabrication, stale-source,
+                                 tool-behaviour, misread-document,
+                                 transcription-artefact, search-snippet, other> \
+                       --source "<url or file path that settled it, or omit>" \
+                       --surface "<file the wrong claim appeared in, or chat>" \
+                       --context "what was being worked on" \
+                       --trigger "the question that produced the wrong claim,
+                                  in enough detail to re-pose it later" \
+                       --project "<today's project tag>" \
+                       --via nightly
+     Add --generalisable if it is a trap that should become a rule.
+     Add --unresolved if it could not be settled either way.
+
+   The CLI owns the schema, continues the day's id sequence, guarantees the
+   file stays valid JSONL, and REFUSES a duplicate of anything already
+   recorded today — an agent may have recorded some of these live, and both
+   paths are active.
 
    Rules, which matter more than coverage:
-   - If nothing was corrected today, append NOTHING. Do not write an empty
-     record or a placeholder. A set contaminated with invented cases is worse
+   - If nothing was corrected today, record NOTHING. Do not invent a case to
+     have something to report. A set contaminated with invented cases is worse
      than a small one.
-   - Never invent a value to fill a field. Leave a string empty if unknown.
-   - Append only. Never rewrite or delete existing lines in that file.
-   - One JSON object per line, no pretty-printing, no wrapping array.
+   - Never invent a value to fill a field. Omit what you do not know.
 
 4. Decide whether today merits a log. The CLAUDE.md rule: "For routine
    sessions with nothing worth recording, say so and I'll skip it." If today
